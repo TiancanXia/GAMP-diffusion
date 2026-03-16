@@ -1,0 +1,1145 @@
+import math
+import os
+from functools import partial
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from util.img_utils import clear_color
+from .posterior_mean_variance import get_mean_processor, get_var_processor
+
+from GAMP import GAMP
+
+__SAMPLER__ = {}
+
+def register_sampler(name: str):
+    def wrapper(cls):
+        if __SAMPLER__.get(name, None):
+            raise NameError(f"Name {name} is already registered!") 
+        __SAMPLER__[name] = cls
+        return cls
+    return wrapper
+
+
+def get_sampler(name: str):
+    if __SAMPLER__.get(name, None) is None:
+        raise NameError(f"Name {name} is not defined!")
+    return __SAMPLER__[name]
+
+
+def create_sampler(sampler,
+                   steps,
+                   noise_schedule,
+                   model_mean_type,
+                   model_var_type,
+                   dynamic_threshold,
+                   clip_denoised,
+                   rescale_timesteps,
+                   timestep_respacing=""):
+    
+    sampler = get_sampler(name=sampler)
+    
+    betas = get_named_beta_schedule(noise_schedule, steps)
+    if not timestep_respacing:
+        timestep_respacing = [steps]
+         
+    return sampler(use_timesteps=space_timesteps(steps, timestep_respacing),
+                   betas=betas,
+                   model_mean_type=model_mean_type,
+                   model_var_type=model_var_type,
+                   dynamic_threshold=dynamic_threshold,
+                   clip_denoised=clip_denoised, 
+                   rescale_timesteps=rescale_timesteps)
+
+
+class GaussianDiffusion:
+    def __init__(self,
+                 betas,
+                 model_mean_type,
+                 model_var_type,
+                 dynamic_threshold,
+                 clip_denoised,
+                 rescale_timesteps
+                 ):
+
+        # use float64 for accuracy.
+        betas = np.array(betas, dtype=np.float64)
+        self.betas = betas
+        assert self.betas.ndim == 1, "betas must be 1-D"
+        assert (0 < self.betas).all() and (self.betas <=1).all(), "betas must be in (0..1]"
+
+        self.num_timesteps = int(self.betas.shape[0])
+        self.rescale_timesteps = rescale_timesteps
+
+        alphas = 1.0 - self.betas
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
+        assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.posterior_variance = (
+            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        # log calculation clipped because the posterior variance is 0 at the
+        # beginning of the diffusion chain.
+        self.posterior_log_variance_clipped = np.log(
+            np.append(self.posterior_variance[1], self.posterior_variance[1:])
+        )
+        self.posterior_mean_coef1 = (
+            betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        self.posterior_mean_coef2 = (
+            (1.0 - self.alphas_cumprod_prev)
+            * np.sqrt(alphas)
+            / (1.0 - self.alphas_cumprod)
+        )
+
+        self.mean_processor = get_mean_processor(model_mean_type,
+                                                 betas=betas,
+                                                 dynamic_threshold=dynamic_threshold,
+                                                 clip_denoised=clip_denoised)    
+    
+        self.var_processor = get_var_processor(model_var_type,
+                                               betas=betas)
+        ###
+        self.lambda_t = 0.5 * np.log(self.alphas_cumprod / (1.0 - self.alphas_cumprod))
+        denominator = np.clip(1.0 - self.alphas_cumprod_prev, 1e-8, 1.0)
+        self.lambda_next = 0.5 * np.log(self.alphas_cumprod_prev / denominator)
+        self.old_x_0_list = []
+        self.old_x_0_listhat = []
+
+    def q_mean_variance(self, x_start, t):
+        """
+        Get the distribution q(x_t | x_0).
+
+        :param x_start: the [N x C x ...] tensor of noiseless inputs.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+        """
+        
+        mean = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start) * x_start
+        variance = extract_and_expand(1.0 - self.alphas_cumprod, t, x_start)
+        log_variance = extract_and_expand(self.log_one_minus_alphas_cumprod, t, x_start)
+
+        return mean, variance, log_variance
+
+    def q_sample(self, x_start, t):
+        """
+        Diffuse the data for a given number of diffusion steps.
+
+        In other words, sample from q(x_t | x_0).
+
+        :param x_start: the initial data batch.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise: if specified, the split-out normal noise.
+        :return: A noisy version of x_start.
+        """
+        noise = torch.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        
+        coef1 = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start)
+        coef2 = extract_and_expand(self.sqrt_one_minus_alphas_cumprod, t, x_start)
+
+        return coef1 * x_start + coef2 * noise
+
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        """
+        Compute the mean and variance of the diffusion posterior:
+
+            q(x_{t-1} | x_t, x_0)
+
+        """
+        assert x_start.shape == x_t.shape
+        coef1 = extract_and_expand(self.posterior_mean_coef1, t, x_start)
+        coef2 = extract_and_expand(self.posterior_mean_coef2, t, x_t)
+        posterior_mean = coef1 * x_start + coef2 * x_t
+        posterior_variance = extract_and_expand(self.posterior_variance, t, x_t)
+        posterior_log_variance_clipped = extract_and_expand(self.posterior_log_variance_clipped, t, x_t)
+
+        assert (
+            posterior_mean.shape[0]
+            == posterior_variance.shape[0]
+            == posterior_log_variance_clipped.shape[0]
+            == x_start.shape[0]
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_sample_loop(self,
+                      model,
+                      x_start,
+                      measurement,
+                      measurement_cond_fn,
+                      record,
+                      save_root):
+        """
+        The function used for sampling from noise.
+        """ 
+        img = x_start
+        device = x_start.device
+
+        pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        for idx in pbar:
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            
+            img = img.requires_grad_()
+            out = self.p_sample(x=img, t=time, model=model)
+            
+            # Give condition.
+            noisy_measurement = self.q_sample(measurement, t=time)
+
+            # TODO: how can we handle argument for different condition method?
+            img, distance = measurement_cond_fn(x_t=out['sample'],
+                                      measurement=measurement,
+                                      noisy_measurement=noisy_measurement,
+                                      x_prev=img,
+                                      x_0_hat=out['pred_xstart'],
+                                      a_t=self.sqrt_alphas_cumprod[time],
+                                      b2_t=1 - self.alphas_cumprod[time])
+            img = img.detach_()
+           
+            pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            if record:
+                if idx % 10 == 0:
+                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    plt.imsave(file_path, clear_color(img))
+
+        return img
+
+    def _step_mmps(self,
+                      model,
+                      x_start,
+                      measurement,
+                      H_funcs,
+                      noise_std,
+                      record,
+                      save_root,
+                      alg_name,
+                      diffusion_sampler):
+        """
+        The function used for sampling from noise.
+        """ 
+        img = x_start
+        device = x_start.device
+
+        pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        for idx in pbar:
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            
+            img = img.requires_grad_()
+            out = self.p_sample(x=img, t=time, model=model)
+            x_0_hat = out['pred_xstart']
+            x_t = out['sample']
+               
+            # TODO: how can we handle argument for different condition method?
+            if alg_name == 'mmps':
+                n_iters = 1  # 3 for GDPM    1 FOR MMPS 
+            else:
+                n_iters = 3
+            noise_sigma2 = noise_std ** 2
+            b2_t = (1 - self.alphas_cumprod[time])
+            a_t = self.sqrt_alphas_cumprod[time]
+            if alg_name == 'mmps':
+                sigma_t = b2_t / (a_t ** 1)  # MMPS
+            else:
+                sigma_t = b2_t # PGDM
+
+            pbar.set_postfix({'sigma_t': sigma_t.item()}, refresh=False)
+
+            bs = 1 # H_funcs.block_num
+            N = H_funcs.M
+            M =  -1 # H_funcs.N
+            y = measurement.view(bs, M)
+
+            if alg_name == 'dps':
+                # DPS like
+                # norm_grad = score_y_given_x
+                # img = x_t + norm_grad * 0.003
+                ##  GDMP noise 0.05 best 0.03 noise 0.5 best 0.01   MMPS noise 0.05 best 0.003
+
+                # DPS
+                value = torch.tensor(H_funcs.block_num * int(H_funcs.N // 3), dtype=torch.float32)
+                input_size = int(torch.sqrt(value).item())
+                difference = measurement.view(1,3,input_size,input_size) - H_funcs.forward(x_0_hat.view(1, -1))
+                norm = torch.linalg.norm(difference)
+                norm_grad = torch.autograd.grad(outputs=norm, inputs=img)[0]
+                img = x_t - norm_grad * 2  # noise 0.05 best 2
+
+            else:
+                # PGDM/MMPS
+                # Compute b = y - A * E[x|x_t]
+                Ax0 = H_funcs.H(x_0_hat.view(1, -1))  # (bs, M)
+                b = y - Ax0.view(bs, M)  # (bs, M)
+
+                def M_product(v):
+                    # Compute A^T * v
+                    At_v = H_funcs.Ht(v.view(1, -1))
+
+                    # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
+                    vjp_input = (sigma_t) * At_v  # (1,-1)  # 0.1
+
+                    if alg_name == 'mmps':
+                        # MMPS  asymmetric
+                        vjp_input_for_grad = vjp_input.view_as(img)
+                        vjp = torch.autograd.grad(
+                            outputs=x_0_hat,
+                            inputs=img,
+                            grad_outputs=vjp_input_for_grad,
+                            retain_graph=True  #
+                        )[0]
+
+                    else:
+                        # PGDM
+                        vjp = vjp_input
+
+                    # Obtain M*v = \Sigma_y * v + A * vjp
+                    Avjp = H_funcs.H(vjp.view(1, -1)).view(bs, M)
+                    return noise_sigma2 * v + Avjp
+
+                v = torch.zeros_like(b)
+                r = b - M_product(v)
+                p = r.clone()
+
+                # CG iteration (bs, N) processing
+                for _ in range(n_iters):
+                    Mp = M_product(p)
+
+                    # Compute alpha = (r^T * r) / (p^T * M * p)
+                    r_dot_r = torch.sum(r * r, dim=1, keepdim=True)
+                    p_dot_Mp = torch.sum(p * Mp, dim=1, keepdim=True)
+                    alpha = r_dot_r / (p_dot_Mp + 1e-8)
+
+                    v = v + alpha * p
+                    r_new = r - alpha * Mp
+
+                    # Compute beta = (r_new^T * r_new) / (r^T * r)
+                    r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                    beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+
+                    p = r_new + beta * p
+                    r = r_new
+
+                final_vjp = H_funcs.Ht(v.view(1, -1))  # (1 -1)
+                final_vjp_input = final_vjp.view_as(img)
+
+                score_y_given_x = torch.autograd.grad(
+                    outputs=x_0_hat,
+                    inputs=img,
+                    grad_outputs=final_vjp_input,
+                    retain_graph=False
+                )[0]  #
+
+                # DDPM
+                if diffusion_sampler == 'ddpm':
+                    norm_grad = ((1 - self.alphas_cumprod[time]) * score_y_given_x) / self.sqrt_alphas_cumprod[time]
+                    coef1 = extract_and_expand(self.posterior_mean_coef1, time, img)
+                    img = x_t + norm_grad * coef1
+                else:
+                    if alg_name == 'pgdm':
+                        # DDIM PGDM
+                        scale = torch.sqrt(out["alpha_prev"] * out["alpha"])
+                        norm_grad = sigma_t * score_y_given_x
+                        img = x_t + norm_grad * scale
+                    elif alg_name == 'mmps':
+                        # DDIM MMPS
+                        scale = out["scale"]
+                        norm_grad = sigma_t * score_y_given_x
+                        img = x_t + norm_grad * scale
+           
+            img = img.detach_()
+           
+            if record:
+                if idx % 10 == 0:
+                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    plt.imsave(file_path, clear_color(img))
+
+        return img
+
+    def _step_gamp(self,
+                           model,
+                           x_start,
+                           measurement,
+                           H_funcs,
+                           noise_std,
+                           record,
+                           save_root,
+                           alg_name,
+                           diffusion_sampler):
+        """
+        The function used for sampling from noise.
+        """
+        img = x_start
+        device = x_start.device
+
+        self.old_x_0_listhat = []
+
+        pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        x_hat_temp = torch.zeros(H_funcs.block_num, H_funcs.M, device=device)
+        tau_x_temp = torch.ones(H_funcs.block_num, H_funcs.M, device=device)
+        s_temp = torch.zeros(H_funcs.block_num, H_funcs.N, device=device)
+        y = measurement.view(H_funcs.block_num, H_funcs.N)
+
+        gamp = GAMP(
+            prior=lambda a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt: GAMP.sparse_prior3(a_t, b2_t, tau_r, x_t, x_0_hat,
+                                                                                        nabla_r_xt),
+            likelihood=lambda p, tau_p, y, noise_sigma: GAMP.awgn_likelihood_cs(p, tau_p, y, noise_sigma),
+            max_iter=22)   # 2 的时候出问题  1 3
+
+        for loop_idx, idx in enumerate(pbar):
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            # print(time)
+            img = img.requires_grad_()
+            out = self.p_sample(x=img, t=time, model=model)
+            x_0_hat = out['pred_xstart']
+            x_t = img
+            b2_t = (1 - self.alphas_cumprod[time])
+            a_t = self.sqrt_alphas_cumprod[time]
+            noise_sigma = noise_std
+            # sigma_t = b2_t / (a_t ** 2) # 
+            sigma_t = b2_t / (a_t ** 2) # MMPS 1
+            delta0 = noise_sigma ** 2
+            bs = H_funcs.block_num
+            M = H_funcs.N
+            N = H_funcs.M
+
+            x_hat = x_hat_temp
+            tau_x = tau_x_temp
+            s = s_temp
+
+            for iter in range(gamp.max_iter):
+                with torch.no_grad():
+                    # --- 输出节点更新 ---
+                    if iter == 0:
+                        tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
+
+                    p = H_funcs.H(x_hat.view(1, -1)).view(bs, M) - s * tau_p
+
+                    z_hat, tau_z = gamp.likelihood(p, tau_p, y, delta0)
+                    tau_z = torch.real(tau_z)
+
+                    tau_p_clamped = torch.clamp(tau_p, min=1e-25)
+                    s = (z_hat - p) / tau_p_clamped
+                    tau_s = (1.0 - tau_z / tau_p_clamped) / tau_p_clamped
+                    tau_s = torch.real(tau_s)
+                    tau_s = torch.clamp(tau_s, min=1e-25)
+
+                    # --- 输入节点更新 ---
+                    A2_tau_s = H_funcs.Ht_squared(tau_s.view(1, -1)).view(bs, N)
+                    tau_r = 1.0 / torch.clamp(A2_tau_s, min=1e-25)
+
+                    At_s = H_funcs.Ht(s.view(1, -1)).view(bs, N)
+                    r = x_hat + tau_r * At_s
+
+                    if alg_name == 'gamp_dmps':
+                        # DMPS
+                        x_t_flat = x_t.view(bs, N)
+                        diff = r - x_t_flat / a_t
+                        nabla_r_xt = diff / (1 * a_t * tau_r + b2_t / a_t)
+
+                    # elif alg_name == 'gamp-pgdm':
+                        # PGDM
+                        # with torch.enable_grad():
+                        #     x_0_hat_flat = x_0_hat.view(bs, N)
+                        #     diff = r.detach() - x_0_hat_flat
+                        #     norm = 0.5 * torch.sum(diff ** 2)
+                        #     norm_grad = torch.autograd.grad(outputs=norm, inputs=img, create_graph=False, retain_graph=False)[0]
+                        # nabla_r_xt = - norm_grad.view(bs, N) / (tau_r + b2_t / (a_t ** 2))
+                        # del norm_grad, norm, diff
+                    else:
+                        # MMPS
+                        ## Compute b = r - E[x|x_t]
+                        bb = r.detach() - x_0_hat.view(1, -1).view(bs, N)  # (bs, N)
+                        if alg_name == 'gamp_pgdm':
+                            n_iters = 1
+                        else:
+                            n_iters = 1
+
+                        def M_product(vv):
+                            # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
+                            vjp_input = (sigma_t) * vv.view(1, -1)  # (1,-1)  # 0.1
+
+                            if alg_name == 'gamp_pgdm':
+                                # PGDM
+                                vjp = vjp_input
+
+                            elif alg_name == 'gamp_mmps':
+                                # MMPS  asymmetric
+                                vjp_input_for_grad = vjp_input.view_as(img)
+                                vjp = torch.autograd.grad(
+                                    outputs=x_0_hat,
+                                    inputs=img,
+                                    grad_outputs=vjp_input_for_grad,
+                                    retain_graph=True
+                                )[0]
+                            # Obtain M*v = \Sigma_y * v + A * vjp
+                            Avjp = vjp.view(1, -1).view(bs, N)
+                            return tau_r * vv + 1 * Avjp
+
+                        vv = torch.zeros_like(bb)
+                        rr = bb - M_product(vv)
+                        pp = rr.clone()
+                        # CG iteration (bs, N) processing
+                        for _ in range(n_iters):
+                            Mp = M_product(pp)
+                            # Compute alpha = (r^T * r) / (p^T * M * p)
+                            r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
+                            p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
+                            alpha = r_dot_r / (p_dot_Mp + 1e-8)
+                            vv = vv + alpha * pp
+                            r_new = rr - alpha * Mp
+                            # Compute beta = (r_new^T * r_new) / (r^T * r)
+                            r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                            beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+                            pp = r_new + beta * pp
+                            rr = r_new
+
+                        final_vjp_input = vv.view(1, -1).view_as(img)  # (1 -1)
+
+                        is_last_grad = (iter == gamp.max_iter - 1)
+                        score_y_given_x = torch.autograd.grad(
+                            outputs=x_0_hat,
+                            inputs=img,
+                            grad_outputs=final_vjp_input,
+                            retain_graph=not is_last_grad
+                        )[0]  #
+
+                    nabla_r_xt = score_y_given_x
+                    del final_vjp_input
+
+                # 调用 prior
+                x_hat, tau_x, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
+                tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
+
+                del p, z_hat, tau_p_clamped, tau_s, A2_tau_s, At_s, r, nabla_r_xt
+
+            x_hat_temp = x_hat
+            tau_x_temp = tau_x
+            s_temp = s
+
+            if diffusion_sampler == 'ddpm':
+                # DDPM
+                img = self.mean_processor.q_posterior_mean(x_hat1, img, time)
+                noise = torch.randn_like(img)
+                if idx != 0:  # no noise when t == 0
+                    img += torch.exp(0.5 * out['log_variance']) * noise  # 0.5
+
+            elif diffusion_sampler == 'ddim':
+                # DDIM
+                eta = 1.0
+                alpha_bar = extract_and_expand(self.alphas_cumprod, time, x_t)
+                alpha_bar_prev = extract_and_expand(self.alphas_cumprod_prev, time, x_t)
+                sigma = (
+                        eta
+                        * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                        * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
+                )
+                # Equation 12.
+                noise = torch.randn_like(img)
+                coef1 = extract_and_expand(self.sqrt_recip_alphas_cumprod, time, x_t)
+                coef2 = extract_and_expand(self.sqrt_recipm1_alphas_cumprod, time, x_t)
+                eps = (coef1 * x_t - x_hat1) / coef2
+                mean_pred = (
+                        x_hat1 * torch.sqrt(alpha_bar_prev)
+                        + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+                )
+                img = mean_pred
+                if idx != 0:
+                    img += sigma * noise
+
+            # DPM-solver++
+            # x_0_cur = x_hat1
+
+            # # 1. 准备当前步和下一步的系数 [cite: 58, 659]
+            # lambda_cur = self.lambda_t[idx]
+            # lambda_next = self.lambda_next[idx]
+            # alpha_next = np.sqrt(self.alphas_cumprod_prev[idx])
+            # sigma_cur = np.sqrt(1.0 - self.alphas_cumprod[idx])
+            # sigma_next = np.sqrt(1.0 - self.alphas_cumprod_prev[idx])
+            # # 计算当前步长 h
+            # h = lambda_next - lambda_cur
+
+            # # --- 严格按照 Algorithm 2 实现 ---
+            # if loop_idx == 0 or len(self.old_x_0_listhat) == 0:
+            #     # Step 4: 第一步执行一阶更新 (DPM-Solver++ 1) [cite: 215, 303]
+            #     # x_next = (sigma_next / sigma_cur) * x - alpha_next * (exp(-h) - 1) * x_theta
+            #     img = (sigma_next / sigma_cur) * img - alpha_next * torch.expm1(-torch.tensor(h, device=device)) * x_0_cur
+
+            #     # Step 5: 将当前输出存入缓存 [cite: 218]
+            #     self.old_x_0_listhat.append((lambda_cur, x_0_cur))
+
+            # else:
+            #     # Step 7: 计算步长比率 r = h_{i-1} / h_i [cite: 221]
+            #     lambda_prev, x_0_prev = self.old_x_0_listhat[-1]
+            #     h_prev = lambda_cur - lambda_prev
+            #     r = h_prev / h
+
+            #     # Step 8: 计算二阶估计量 D_i [cite: 225]
+            #     # D_i = (1 + 1/2r) * x_theta_cur - (1/2r) * x_theta_prev
+            #     D_i = (1.0 + 1.0 / (2.0 * r)) * x_0_cur - (1.0 / (2.0 * r)) * x_0_prev
+
+            #     # Step 9: 执行二阶更新
+            #     # x_next = (sigma_next / sigma_cur) * x - alpha_next * (exp(-h) - 1) * D_i
+            #     img = (sigma_next / sigma_cur) * img - alpha_next * torch.expm1(-torch.tensor(h, device=device)) * D_i
+
+            #     # Step 10: 更新缓存，仅保留最近一次信息以实现 2M [cite: 228]
+            #     self.old_x_0_listhat.append((lambda_cur, x_0_cur))
+            #     if len(self.old_x_0_listhat) > 1:
+            #         self.old_x_0_listhat.pop(0)
+
+            img = img.detach_()
+            # pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            if record:
+                if idx % 10 == 0:
+                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    plt.imsave(file_path, clear_color(img))
+            # img = img.clip_(-1,1)
+
+        return img
+
+    def _step_vamp(self,
+                           model,
+                           x_start,
+                           measurement,
+                           H_funcs,
+                           noise_std,
+                           record,
+                           save_root,
+                           alg_name,
+                           diffusion_sampler):
+        """
+        The function used for sampling from noise.
+        """
+        img = x_start
+        device = x_start.device
+
+        pbar = tqdm(list(range(self.num_timesteps))[::-1])
+
+        delta2_0 = noise_std ** 2
+        s2 = H_funcs._S_small ** 2  #
+        delta = 1.0
+        v_A_pri_temp = 10*torch.ones(1, device=device)
+        x_A_pri_temp = torch.zeros(H_funcs.block_num, H_funcs.M, device=device)
+        y = measurement.view(H_funcs.block_num, H_funcs.N)
+        bs = H_funcs.block_num
+        M = H_funcs.N
+        N = H_funcs.M
+        gamp = GAMP(
+            prior=lambda a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt: GAMP.sparse_prior3(a_t, b2_t, tau_r, x_t, x_0_hat,
+                                                                                        nabla_r_xt),
+            likelihood=lambda p, tau_p, y, noise_sigma: GAMP.awgn_likelihood_cs(p, tau_p, y, noise_sigma),
+            max_iter=1)
+
+        for idx in pbar:
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            # print(time)
+            img = img.requires_grad_()
+            out = self.p_sample(x=img, t=time, model=model)
+            x_0_hat = out['pred_xstart']
+            x_t = img
+            b2_t = (1 - self.alphas_cumprod[time])
+            a_t = self.sqrt_alphas_cumprod[time]
+            sigma_t = b2_t / (a_t ** 2)  #
+            v_A_pri = v_A_pri_temp
+            x_A_pri = x_A_pri_temp
+            Turbo = 1
+            with (torch.no_grad()):
+                for i in range(Turbo):
+                    # ---------------------------------------------------------
+                    # 1. LMMSE Estimator (Module A)
+                    # ---------------------------------------------------------
+                    # --- Line 5 x_A_post ---
+                    # (v_A_pri * A * A^T + delta2_0 * I)^-1 * (y - A * x_A_pri)
+                    b = y - H_funcs.H(x_A_pri.view(1, -1)).view(bs, M)
+                    def M_product(p):
+                        # M = v_A_pri * A * A^T + delta2_0 * I
+                        # (1, 1200) -> Ht -> (1, 12288) -> H -> (1, 1200)
+                        temp = H_funcs.H(H_funcs.Ht(p.view(1, -1))).view(bs, M)
+                        return v_A_pri * temp + delta2_0 * p
+
+                        # CG M * u = b
+                    u = torch.zeros_like(b)
+                    r = b - M_product(u)
+                    p = r.clone()
+                    cg_iters = 3
+                    for _ in range(cg_iters):
+                        Mp = M_product(p)
+                        r_dot_r = torch.sum(r * r, dim=1, keepdim=True)
+                        alpha = r_dot_r / (torch.sum(p * Mp, dim=1, keepdim=True) + 1e-12)
+                        u = u + alpha * p
+                        r_new = r - alpha * Mp
+                        beta = torch.sum(r_new * r_new, dim=1, keepdim=True) / (r_dot_r + 1e-12)
+                        p = r_new + beta * p
+                        r = r_new
+
+                    # --- Line 5 x_A_post ---
+                    x_A_post = x_A_pri + v_A_pri * H_funcs.Ht(u.view(1,-1)).view(bs, N)
+                    # --- Line 6   v_A_post ---
+                    # tr(A.T (v_A*AA.T + delta2*I)^-1 A) = sum( lambda / (v_A * lambda + delta2) )
+                    tr_term = torch.sum(s2 / (v_A_pri * s2 + delta2_0))
+                    v_A_post = v_A_pri - (v_A_pri ** 2 / N) * tr_term
+                    # --- Line 7-8 (Extrinsic) ---
+                    v_A_post = torch.clamp(v_A_post, min=1e-25)
+                    v_A_pri = torch.clamp(v_A_pri, min=1e-25)
+                    denom = 1.0 / v_A_post - 1.0 / v_A_pri
+                    denom = torch.clamp(denom, min=1e-8)
+                    v_A_ext = 1.0 / denom
+                    # v_A_ext = 1.0 / (1.0 / v_A_post - 1.0 / v_A_pri)
+                    x_A_ext = v_A_ext * (x_A_post / v_A_post - x_A_pri / v_A_pri)
+                    # Line 9
+                    x_B_pri, v_B_pri = x_A_ext, v_A_ext
+
+                    # MMPS
+                    #   # Compute b = r - E[x|x_t]
+                    bb = x_B_pri.detach() - x_0_hat.view(1, -1).view(bs, N)  # (bs, N)
+                    n_iters = 1
+                    def M_product2(vv):
+                        # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
+                        vjp_input = (sigma_t + 0.1) * vv.view(1, -1)  # (1,-1)  # 0.1
+                        # PGDM
+                        # vjp = vjp_input
+                        # MMPS  asymmetric
+                        vjp_input_for_grad = vjp_input.view_as(img)
+                        vjp = torch.autograd.grad(
+                                outputs=x_0_hat,
+                                inputs=img,
+                                grad_outputs=vjp_input_for_grad,
+                                retain_graph=True
+                        )[0]
+                        # Obtain M*v = \Sigma_y * v + A * vjp
+                        Avjp = vjp.view(1, -1).view(bs, N)
+                        return v_B_pri * vv + 1 * Avjp
+
+                    vv = torch.zeros_like(bb)
+                    rr = bb - M_product2(vv)
+                    pp = rr.clone()
+                    # CG iteration (bs, N) processing
+                    for _ in range(n_iters):
+                        Mp = M_product2(pp)
+                        # Compute alpha = (r^T * r) / (p^T * M * p)
+                        r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
+                        p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
+                        alpha = r_dot_r / (p_dot_Mp + 1e-8)
+                        vv = vv + alpha * pp
+                        r_new = rr - alpha * Mp
+                        # Compute beta = (r_new^T * r_new) / (r^T * r)
+                        r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                        beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+                        pp = r_new + beta * pp
+                        rr = r_new
+
+                    final_vjp_input = vv.view(1, -1).view_as(img)  # (1 -1)
+                    is_last_grad = (iter == gamp.max_iter - 1)
+                    score_y_given_x = torch.autograd.grad(
+                            outputs=x_0_hat,
+                            inputs=img,
+                            grad_outputs=final_vjp_input,
+                            retain_graph=not is_last_grad
+                    )[0]  #
+
+                nabla_r_xt = score_y_given_x
+                del final_vjp_input
+
+                tau_r = v_B_pri * torch.ones_like(x_B_pri)
+                # 调用 prior
+                x_B_post, v_B_post_tensor, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
+
+                del nabla_r_xt
+
+                # Line 13-14
+                v_B_post = torch.mean(v_B_post_tensor)
+                v_B_post = torch.clamp(v_B_post, min=1e-25)
+                v_B_pri = torch.clamp(v_B_pri, min=1e-25)
+                v_B_ext = 1.0 / (1.0 / v_B_post - 1.0 / v_B_pri)
+                x_B_ext = v_B_ext * (x_B_post / v_B_post - x_B_pri / v_B_pri)
+                # Line 15
+                x_A_pri = x_B_ext * delta + x_A_pri * (1 - delta)
+                v_A_pri = v_B_ext * delta + v_A_pri * (1 - delta)
+                # x_A_pri, v_A_pri = x_B_ext, v_B_ext
+
+            v_A_pri_temp = v_A_pri
+            x_A_pri_temp = x_A_pri
+
+            if diffusion_sampler == 'ddpm':
+                # DDPM
+                img = self.mean_processor.q_posterior_mean(x_hat1, img, time)
+                noise = torch.randn_like(img)
+                if idx != 0:  # no noise when t == 0
+                    img += torch.exp(0.5 * out['log_variance']) * noise  # 0.5
+
+            elif diffusion_sampler == 'ddim':
+                # DDIM
+                eta = 1.0
+                alpha_bar = extract_and_expand(self.alphas_cumprod, time, x_t)
+                alpha_bar_prev = extract_and_expand(self.alphas_cumprod_prev, time, x_t)
+                sigma = (
+                        eta
+                        * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                        * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
+                )
+                # Equation 12.
+                noise = torch.randn_like(img)
+                coef1 = extract_and_expand(self.sqrt_recip_alphas_cumprod, time, x_t)
+                coef2 = extract_and_expand(self.sqrt_recipm1_alphas_cumprod, time, x_t)
+                eps = (coef1 * x_t - x_hat1) / coef2
+                mean_pred = (
+                        x_hat1 * torch.sqrt(alpha_bar_prev)
+                        + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+                )
+                img = mean_pred
+                if idx != 0:
+                    img += sigma * noise
+
+            img = img.detach_()
+            # pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            if record:
+                if idx % 10 == 0:
+                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    plt.imsave(file_path, clear_color(img))
+            # img = img.clip_(-1,1)
+
+        return img
+
+    def p_sample_loop_cs(self,
+                      model,
+                      x_start,
+                      measurement,
+                      measurement_cond_fn,
+                      H_funcs=None,
+                      noise_std=0.1,
+                      config=None,
+                      record=False,
+                      save_root=None,
+                      diffusion_sampler = 'mmps'):
+
+        # alg_name
+        alg_name = config.get('algorithm', {}).get('name', 'mmps')
+        # (Algorithm Dispatcher)
+        if 'gamp' in alg_name:
+            img = self._step_gamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+        elif 'vamp' in alg_name:
+            img = self._step_vamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+        else:
+            img = self._step_mmps(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+
+        return img
+
+
+    def p_sample(self, model, x, t):
+        raise NotImplementedError
+
+    def p_mean_variance(self, model, x, t):
+        model_output = model(x, self._scale_timesteps(t))
+        
+        # In the case of "learned" variance, model will give twice channels.
+        if model_output.shape[1] == 2 * x.shape[1]:
+            model_output, model_var_values = torch.split(model_output, x.shape[1], dim=1)
+        else:
+            # The name of variable is wrong. 
+            # This will just provide shape information, and 
+            # will not be used for calculating something important in variance.
+            model_var_values = model_output
+
+        model_mean, pred_xstart = self.mean_processor.get_mean_and_xstart(x, t, model_output)
+        model_variance, model_log_variance = self.var_processor.get_variance(model_var_values, t)
+
+        assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+
+        return {'mean': model_mean,
+                'variance': model_variance,
+                'log_variance': model_log_variance,
+                'pred_xstart': pred_xstart}
+
+    
+    def _scale_timesteps(self, t):
+        if self.rescale_timesteps:
+            return t.float() * (1000.0 / self.num_timesteps)
+        return t
+
+def space_timesteps(num_timesteps, section_counts):
+    """
+    Create a list of timesteps to use from an original diffusion process,
+    given the number of timesteps we want to take from equally-sized portions
+    of the original process.
+    For example, if there's 300 timesteps and the section counts are [10,15,20]
+    then the first 100 timesteps are strided to be 10 timesteps, the second 100
+    are strided to be 15 timesteps, and the final 100 are strided to be 20.
+    If the stride is a string starting with "ddim", then the fixed striding
+    from the DDIM paper is used, and only one section is allowed.
+    :param num_timesteps: the number of diffusion steps in the original
+                          process to divide up.
+    :param section_counts: either a list of numbers, or a string containing
+                           comma-separated numbers, indicating the step count
+                           per section. As a special case, use "ddimN" where N
+                           is a number of steps to use the striding from the
+                           DDIM paper.
+    :return: a set of diffusion steps from the original process to use.
+    """
+    if isinstance(section_counts, str):
+        if section_counts.startswith("ddim"):
+            desired_count = int(section_counts[len("ddim") :])
+            for i in range(1, num_timesteps):
+                if len(range(0, num_timesteps, i)) == desired_count:
+                    return set(range(0, num_timesteps, i))
+            raise ValueError(
+                f"cannot create exactly {num_timesteps} steps with an integer stride"
+            )
+        section_counts = [int(x) for x in section_counts.split(",")]
+    elif isinstance(section_counts, int):
+        section_counts = [section_counts]
+    
+    size_per = num_timesteps // len(section_counts)
+    extra = num_timesteps % len(section_counts)
+    start_idx = 0
+    all_steps = []
+    for i, section_count in enumerate(section_counts):
+        size = size_per + (1 if i < extra else 0)
+        if size < section_count:
+            raise ValueError(
+                f"cannot divide section of {size} steps into {section_count}"
+            )
+        if section_count <= 1:
+            frac_stride = 1
+        else:
+            frac_stride = (size - 1) / (section_count - 1)
+        cur_idx = 0.0
+        taken_steps = []
+        for _ in range(section_count):
+            taken_steps.append(start_idx + round(cur_idx))
+            cur_idx += frac_stride
+        all_steps += taken_steps
+        start_idx += size
+    return set(all_steps)
+
+
+class SpacedDiffusion(GaussianDiffusion):
+    """
+    A diffusion process which can skip steps in a base diffusion process.
+    :param use_timesteps: a collection (sequence or set) of timesteps from the
+                          original diffusion process to retain.
+    :param kwargs: the kwargs to create the base diffusion process.
+    """
+
+    def __init__(self, use_timesteps, **kwargs):
+        self.use_timesteps = set(use_timesteps)
+        self.timestep_map = []
+        self.original_num_steps = len(kwargs["betas"])
+
+        base_diffusion = GaussianDiffusion(**kwargs)  # pylint: disable=missing-kwoa
+        last_alpha_cumprod = 1.0
+        new_betas = []
+        for i, alpha_cumprod in enumerate(base_diffusion.alphas_cumprod):
+            if i in self.use_timesteps:
+                new_betas.append(1 - alpha_cumprod / last_alpha_cumprod)
+                last_alpha_cumprod = alpha_cumprod
+                self.timestep_map.append(i)
+        kwargs["betas"] = np.array(new_betas)
+        super().__init__(**kwargs)
+
+    def p_mean_variance(
+        self, model, *args, **kwargs
+    ):  # pylint: disable=signature-differs
+        return super().p_mean_variance(self._wrap_model(model), *args, **kwargs)
+
+    def training_losses(
+        self, model, *args, **kwargs
+    ):  # pylint: disable=signature-differs
+        return super().training_losses(self._wrap_model(model), *args, **kwargs)
+
+    def condition_mean(self, cond_fn, *args, **kwargs):
+        return super().condition_mean(self._wrap_model(cond_fn), *args, **kwargs)
+
+    def condition_score(self, cond_fn, *args, **kwargs):
+        return super().condition_score(self._wrap_model(cond_fn), *args, **kwargs)
+
+    def _wrap_model(self, model):
+        if isinstance(model, _WrappedModel):
+            return model
+        return _WrappedModel(
+            model, self.timestep_map, self.rescale_timesteps, self.original_num_steps
+        )
+
+    def _scale_timesteps(self, t):
+        # Scaling is done by the wrapped model.
+        return t
+
+
+class _WrappedModel:
+    def __init__(self, model, timestep_map, rescale_timesteps, original_num_steps):
+        self.model = model
+        self.timestep_map = timestep_map
+        self.rescale_timesteps = rescale_timesteps
+        self.original_num_steps = original_num_steps
+
+    def __call__(self, x, ts, **kwargs):
+        map_tensor = torch.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        new_ts = map_tensor[ts]
+        if self.rescale_timesteps:
+            new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
+        return self.model(x, new_ts, **kwargs)
+
+
+@register_sampler(name='ddpm')
+class DDPM(SpacedDiffusion):
+    def p_sample(self, model, x, t):
+        out = self.p_mean_variance(model, x, t)
+        sample = out['mean']
+
+        noise = torch.randn_like(x)
+        if t != 0:  # no noise when t == 0
+            sample += torch.exp(0.5 * out['log_variance']) * noise
+
+        return {'sample': sample, 'pred_xstart': out['pred_xstart'], 'log_variance': out['log_variance']}
+    
+@register_sampler(name="ddim")
+class DDIM(SpacedDiffusion):
+    def __init__(self, eta=1.0, **kwargs):
+        super().__init__(**kwargs)
+
+        self.eta = eta
+
+    def p_sample(self, model, x, t):
+        alpha_t = extract_and_expand(self.alphas_cumprod, t, x)
+        alpha_s = extract_and_expand(self.alphas_cumprod_prev, t, x)
+
+        if t == 0:
+            sigma = 0
+        else:
+            sigma = (
+                self.eta
+                * torch.sqrt((1 - alpha_s) / (1 - alpha_t))
+                * torch.sqrt(1 - alpha_t / alpha_s)
+            )
+
+        out = self.p_mean_variance(model, x, t)
+
+        x_0 = out["pred_xstart"]
+        eps = (x - torch.sqrt(alpha_t) * x_0) / torch.sqrt(1 - alpha_t)
+        x_s = (
+            torch.sqrt(alpha_s) * x_0
+            + torch.sqrt(1 - alpha_s - sigma**2) * eps
+            + sigma * torch.randn_like(x_0)
+        )
+
+        scale = torch.sqrt(alpha_s) - torch.sqrt(1 - alpha_s - sigma**2) * torch.sqrt(
+            alpha_t
+        ) / torch.sqrt(1 - alpha_t)
+
+        return {
+            "sample": x_s,
+            "pred_xstart": x_0,
+            "alpha": alpha_s,
+            "alpha_prev": alpha_t,
+            "scale": scale,
+        }
+
+@register_sampler(name='dpmsolver++')
+class DPM_Solver_plus(SpacedDiffusion):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def p_sample(self, model, x, t, idx=None, total_steps=None):
+        out = self.p_mean_variance(model, x, t)
+        x_0 = out["pred_xstart"]
+        return {
+            "pred_xstart": x_0
+        }
+
+    def clear_history(self):
+        self.old_x_0_list = []
+
+
+# =================
+# Helper functions
+# =================
+
+def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
+    """
+    Get a pre-defined beta schedule for the given name.
+
+    The beta schedule library consists of beta schedules which remain similar
+    in the limit of num_diffusion_timesteps.
+    Beta schedules may be added, but should not be removed or changed once
+    they are committed to maintain backwards compatibility.
+    """
+    if schedule_name == "linear":
+        # Linear schedule from Ho et al, extended to work for any number of
+        # diffusion steps.
+        scale = 1000 / num_diffusion_timesteps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        return np.linspace(
+            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif schedule_name == "cosine":
+        return betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+        )
+    else:
+        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
+
+def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
+    """
+    Create a beta schedule that discretizes the given alpha_t_bar function,
+    which defines the cumulative product of (1-beta) over time from t = [0,1].
+
+    :param num_diffusion_timesteps: the number of betas to produce.
+    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+                      produces the cumulative product of (1-beta) up to that
+                      part of the diffusion process.
+    :param max_beta: the maximum beta to use; use values lower than 1 to
+                     prevent singularities.
+    """
+    betas = []
+    for i in range(num_diffusion_timesteps):
+        t1 = i / num_diffusion_timesteps
+        t2 = (i + 1) / num_diffusion_timesteps
+        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    return np.array(betas)
+
+# ================
+# Helper function
+# ================
+
+def extract_and_expand(array, time, target):
+    array = torch.from_numpy(array).to(target.device)[time].float()
+    while array.ndim < target.ndim:
+        array = array.unsqueeze(-1)
+    return array.expand_as(target)
+
+
+def expand_as(array, target):
+    if isinstance(array, np.ndarray):
+        array = torch.from_numpy(array)
+    elif isinstance(array, np.float):
+        array = torch.tensor([array])
+   
+    while array.ndim < target.ndim:
+        array = array.unsqueeze(-1)
+
+    return array.expand_as(target).to(target.device)
+
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch
+                            dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res.expand(broadcast_shape)
