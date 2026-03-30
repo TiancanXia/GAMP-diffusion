@@ -8,7 +8,7 @@ algorithm:
 
 data:
   name: ffhq # choices: ffhq, bedroom, cat, celeba-hq
-  root: ./data/samples_denoise/ # address to put the associated images
+  root: ./data/ffhq_samples/ # address to put the associated images  ffhq_samples
 
 measurement:
   operator:
@@ -18,4 +18,4 @@ measurement:
 #    sparsity: 2304/16384
   noise: 
     name: gaussian
-    sigma: 0.01
+    sigma: 0.1

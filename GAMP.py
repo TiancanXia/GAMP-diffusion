@@ -138,16 +138,20 @@ class GAMP:
 
     @staticmethod
     def sparse_prior3(a_t: Tensor, b2_t: Tensor, tau_r: Tensor, x_t: Tensor, x_0_hat: Tensor, nabla_r_xt: Tensor):
-        # 核心修改：确保这里的计算都在输入张量所在的设备上执行
+        # 
         b, block_num, M, _ = x_0_hat.shape
         nabla_r_xt1 = nabla_r_xt.view(1, -1)
 
-        # 这里的计算会自动跟随 x_0_hat 的设备 (GPU)
-        nabla_xt_r = 1 * (a_t * x_0_hat - x_t) / (b2_t) + 1 * nabla_r_xt1.view(1, block_num, M, M) # 2 2.5
+        # 
+        nabla_xt_r = 1 * (a_t * x_0_hat - x_t) / (b2_t) + 1 * nabla_r_xt1.view(1, block_num, M, M) #
         x_hat1 = (x_t + b2_t * 1 * nabla_xt_r) / (a_t)
 
         x_hat = x_hat1.view(1, -1).view(tau_r.shape)
         tau_x = (b2_t / a_t ** 2) - (b2_t ** 2 / a_t ** 2) / (1 * (a_t ** 2) * tau_r  + b2_t) # 1 * (a_t ** 2) * tau_r + b2_t
-        tau_x = torch.clamp(tau_x, min=1e-25, max=1e8)
+
+        # inflation_factor = 1.0 + 0.5 * b2_t.item()
+        # tau_x = tau_x * inflation_factor
+        
+        tau_x = torch.clamp(tau_x, min=1e-15, max=1e8)
 
         return x_hat, tau_x, x_hat1

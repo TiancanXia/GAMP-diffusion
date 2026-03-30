@@ -53,17 +53,15 @@ class LinearOperator(ABC):
 
 @register_operator(name='CS')
 class BlockCS_H(LinearOperator):
-    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 588//1, device='cuda'):
+    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 1323//1, device='cuda'):
         # 12288 1200/3072/588/6075/1323
         """
-        初始化分块压缩感知算子。
-
         Args:
-            img_dim: 图像总像素数 (3*256*256 = 196608)
-            block_num: 分块数量 (64)
-            block_dim: 每个块的维度 M (3072)
-            compressed_dim: 观测维度 N (768)
-            device: 运行设备
+            img_dim:  (3*256*256 = 196608)
+            block_num:  (64/16)
+            block_dim:  M (3072)
+            compressed_dim:  N (768)
+            device: 
         """
         self.img_dim = img_dim
         self.block_num = block_num
@@ -71,76 +69,74 @@ class BlockCS_H(LinearOperator):
         self.N = compressed_dim
         self.device = device
 
-        # 1. 构建 DCT 矩阵 W (M x M)
-        # 使用 DCT-II 定义
+        # 1. Construct DCT Matrix W (M x M)
+        # DCT-II Definition
         # W_ij = c_i * cos(pi * i * (2j + 1) / (2M))
         # c_0 = sqrt(1/M), c_k = sqrt(2/M)
         print("Constructing DCT matrix...")
         i = torch.arange(self.M, device=device).unsqueeze(1)  # 0..M-1 (M, 1)
         j = torch.arange(self.M, device=device).unsqueeze(0)  # 0..M-1 (1, M)
 
-        # DCT 系数
+        # DCT coefficients
         c = torch.ones(self.M, 1, device=device) * np.sqrt(2 / self.M)
         c[0, 0] = np.sqrt(1 / self.M)
 
         # W[i, j]
         W = c * torch.cos(np.pi * i * (2 * j + 1) / (2 * self.M))
 
-        # 2. 构建符号矩阵 Theta (M x M, 对角)
+        # 2. Theta (M x M, diagnol)
         print("Constructing Random Sign matrix...")
         signs = torch.sign(torch.randn(self.M, device=device))
-        # 实际上我们不需要构建完整的对角阵，只需要将 W 的列乘以符号即可
-        # A = S * W * Theta -> 相当于 W 的每一列乘以 Theta 的对角元素
-        W_Theta = W * signs.unsqueeze(0)  # 广播乘法: (M, M) * (1, M)
+        # A = S * W * Theta
+        W_Theta = W * signs.unsqueeze(0)  # Broadcast: (M, M) * (1, M)
 
-        # 3. 构建选择矩阵 S (N x M)
-        # 实际上就是随机选择 N 行
+        # 3. S (N x M)
         print("Constructing Selection matrix...")
         perm = torch.randperm(self.M, device=device)
         selection_indices = perm[:self.N]
 
-        # 4. 组合得到压缩感知矩阵 A (N x M)
-        # A = S * (W * Theta) -> 选取 W_Theta 的特定行
+        # 4. A (N x M)
+        # A = S * (W * Theta) -> Select W_Theta rows
         self.A = W_Theta[selection_indices, :]  # Shape: (768, 3072)
         #
         # torch.manual_seed(333)
 
-        # 生成高斯随机矩阵 A ~ N(0, 1/M)
-        # 其中 M = compressed_dim，确保方差为 1/M
+        # Gaussian random matrix A ~ N(0, 1/M)
+        # M = compressed_dim, variance 1/M
         # print("Construction of A...")
         # A = torch.randn(compressed_dim, block_dim)
 
-        # 5. 预计算 A 的 SVD 分解以适配 H_functions 接口
+        # 5. A  SVD decomposition
         # A = U_small * S_small * V_small.T
         # print("Computing SVD of A...")
         #
         # _, _, self.A = torch.linalg.svd(A, full_matrices = False)
 
-        # 使用 some=False 以获得完整的 V (M x M) # torch.svd(self.A, some=False)
+        # Use some=False to obtain V (M x M) # torch.svd(self.A, some=False)
         # self._U_small, self._S_small, self._Vh = torch.svd_lowrank(self.A, q=min(self.A.shape[-2:]))
         # self._V_small = self._Vh.t()
         #
-        # # _V_small 是 (M, M), _U_small 是 (N, N), _S_small 是 (N,)
-        # # H_functions 需要转置形式
+        # # _V_small (M, M), _U_small (N, N), _S_small (N,)
+        # # H_functions ^ T
         # self._Vt_small = self._V_small.t()  # (M, M)
         # self._Ut_small = self._U_small.t()  # (N, N)
         #
-        # # 处理奇异值中的极小值（数值稳定性）
+        # # For stability
         ZERO = 1e-3
         self._S_small = torch.linalg.svdvals(self.A)
         self._S_small[self._S_small < ZERO] = 0
 
-        # 6. 构建 A 的平方矩阵 A2 = |A|^2  ########################
+        # 6. A2 = |A|^2  ########################
         print("Computing the square of A...")
         self.A2 = torch.abs(self.A) ** 2
         self.A2_t = self.A2.t()
 
-        # # 缓存完整的奇异值向量 (重复 block_num 次)
+        # # complete singular vectors (repeat block_num times)
         # self._singulars_full = self._S_small.repeat(self.block_num)
 
     def _prepare_input(self, vec):
-        """将输入向量统一为 (Batch, img_dim) 的形状"""
-        if vec.dim() == 4:  # 假设是 (B, C, H, W) 格式
+        """ (Batch, img_dim) """
+        if vec.dim() == 4:  #  (B, C, H, W) 
             return vec.reshape(vec.shape[0], -1)
         elif vec.dim() == 2:
             return vec
@@ -149,14 +145,13 @@ class BlockCS_H(LinearOperator):
 
     def _block_matmul(self, mat, vec, input_dim, output_dim):
         """
-        辅助函数：执行分块矩阵乘法
-        vec: (Batch, Total_Input_Dim) - 已经过 reshape
-        mat: (Small_Output_Dim, Small_Input_Dim) - 小矩阵
+        vec: (Batch, Total_Input_Dim) - reshape
+        mat: (Small_Output_Dim, Small_Input_Dim) 
         Returns: (Batch, Total_Output_Dim)
         """
         b, total_input = vec.shape
 
-        # 检查输入维度是否正确
+        # check
         if total_input != self.block_num * input_dim:
             raise ValueError(f"Input dimension mismatch. Expected {self.block_num * input_dim}, got {total_input}")
 
@@ -164,7 +159,7 @@ class BlockCS_H(LinearOperator):
         vec_reshaped = vec.view(b, self.block_num, input_dim)
 
         # 2. Matmul: (Batch, Block_Num, In) x (Out, In)^T -> (Batch, Block_Num, Out)
-        # 使用 functional.linear: y = xA^T
+        # functional.linear: y = xA^T
         # out_reshaped = torch.nn.functional.linear(vec_reshaped, mat)
         out_reshaped = torch.matmul(vec_reshaped, mat.transpose(0, 1))
 
@@ -179,8 +174,8 @@ class BlockCS_H(LinearOperator):
 
     def H(self, vec):
         """
-        直接应用压缩感知矩阵 A
-        Input: (Batch, C, H, W) 或 (Batch, 196608)
+        A
+        Input: (Batch, C, H, W) or (Batch, 196608)
         Output: (Batch, 49152)
         """
         temp = self._prepare_input(vec)
@@ -188,8 +183,8 @@ class BlockCS_H(LinearOperator):
 
     def Ht(self, vec):
         """
-        直接应用压缩感知矩阵 A 的转置
-        Input: (Batch, 49152) 或 (Batch, C, H, W) 但 H*W*C = 49152
+        A ^ H
+        Input: (Batch, 49152) or (Batch, C, H, W) H*W*C = 49152
         Output: (Batch, 196608)
         """
         temp = self._prepare_input(vec)
@@ -206,8 +201,8 @@ class BlockCS_H(LinearOperator):
 
     def H_squared(self, vec):
         """
-        应用矩阵 A2 = |A|^2
-        Input: (Batch, C, H, W) 或 (Batch, 196608)
+         A2 = |A|^2
+        Input: (Batch, C, H, W) or (Batch, 196608)
         Output: (Batch, 49152)
         """
         temp = self._prepare_input(vec)
@@ -215,8 +210,8 @@ class BlockCS_H(LinearOperator):
     
     def Ht_squared(self, vec):
         """
-        应用矩阵 A2 的转置
-        Input: (Batch, 49152) 或 (Batch, C, H, W) 但 H*W*C = 49152
+         A2 ^ H
+        Input: (Batch, 49152) or (Batch, C, H, W) H*W*C = 49152
         Output: (Batch, 196608)
         """
         temp = self._prepare_input(vec)

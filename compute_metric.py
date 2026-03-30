@@ -28,17 +28,17 @@ lpips_delta_list = []
 lpips_normal_list = []
 
 ssim_delta_list =[]
-ssim_normal_list = []  # 新增SSIM列表
+ssim_normal_list = []  # 
 
-with torch.no_grad():  # 优化1：禁用梯度计算
-    for idx in tqdm(range(12)):
+with torch.no_grad():  # 
+    for idx in tqdm(range(100)):
         fname = str(idx).zfill(5)
 
-        # 读取并确保为 float32 [0, 1]
+        # float32 [0, 1]
         label_np = plt.imread(label_root / f'{fname}.png')[:, :, :3].astype(np.float32)
         recon_np = plt.imread(delta_recon_root / f'{fname}.png')[:, :, :3].astype(np.float32)
 
-        # SSIM (修正参数冲突)
+        # SSIM
         ssim_delta = structural_similarity(
             label_np, recon_np,
             data_range=1.0,
@@ -50,17 +50,17 @@ with torch.no_grad():  # 优化1：禁用梯度计算
         psnr_delta = peak_signal_noise_ratio(label_np, recon_np, data_range=1.0)
         psnr_delta_list.append(psnr_delta)
 
-        # LPIPS 预处理
+        # LPIPS
         t_recon = torch.from_numpy(recon_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2. - 1.
         t_label = torch.from_numpy(label_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2. - 1.
 
-        # LPIPS 计算 (优化2：detach 并转为标量)
+        # LPIPS
         dist = loss_fn_vgg(t_recon, t_label)
         lpips_delta_list.append(dist.item())
 
         print(f'DPS PSNR: {psnr_delta:.4f} | SSIM: {ssim_delta:.4f} | LPIPS: {dist.item():.4f}')
 
-# 计算平均值
+# 
 psnr_avg = np.mean(psnr_delta_list)
 ssim_avg = np.mean(ssim_delta_list)
 lpips_avg = np.mean(lpips_delta_list)
@@ -74,12 +74,12 @@ print(f'DPS PSNR: {psnr_avg:.4f} | SSIM: {ssim_avg:.4f} | LPIPS: {lpips_avg:.4f}
 #     delta_recon = plt.imread(delta_recon_root / f'{fname}.png')[:, :, :3]
 #     # normal_recon = plt.imread(normal_recon_root / f'{fname}.png')[:, :, :3]
 #
-#     # ========== 新增：SSIM计算 (直接在[0,1]范围计算) ==========
+#     # ========== SSIM([0,1]) ==========
 #     ssim_delta = structural_similarity(
 #         label, delta_recon,
-#         data_range=1.0,  # 输入范围是[0,1]
-#         channel_axis=2,  # 通道在第三维 (HWC格式)
-#         multichannel=True  # 兼容旧版skimage
+#         data_range=1.0,  # [0,1]
+#         channel_axis=2,  # 
+#         multichannel=True  # skimage
 #     )
 #     ssim_delta_list.append(ssim_delta)
 #

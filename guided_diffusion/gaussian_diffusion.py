@@ -240,17 +240,15 @@ class GaussianDiffusion:
             x_t = out['sample']
                
             # TODO: how can we handle argument for different condition method?
-            if alg_name == 'mmps':
-                n_iters = 1  # 3 for GDPM    1 FOR MMPS 
-            else:
-                n_iters = 3
             noise_sigma2 = noise_std ** 2
             b2_t = (1 - self.alphas_cumprod[time])
             a_t = self.sqrt_alphas_cumprod[time]
             if alg_name == 'mmps':
                 sigma_t = b2_t / (a_t ** 1)  # MMPS
+                n_iters = 5  # 1 FOR MMPS 
             else:
                 sigma_t = b2_t # PGDM
+                n_iters = 3  # 3 for GDPM
 
             pbar.set_postfix({'sigma_t': sigma_t.item()}, refresh=False)
 
@@ -295,7 +293,6 @@ class GaussianDiffusion:
                             grad_outputs=vjp_input_for_grad,
                             retain_graph=True  #
                         )[0]
-
                     else:
                         # PGDM
                         vjp = vjp_input
@@ -304,28 +301,59 @@ class GaussianDiffusion:
                     Avjp = H_funcs.H(vjp.view(1, -1)).view(bs, M)
                     return noise_sigma2 * v + Avjp
 
-                v = torch.zeros_like(b)
-                r = b - M_product(v)
-                p = r.clone()
+                # v = torch.zeros_like(b)
+                # r = b # - M_product(v)
+                # p = r.clone()
+                # # CG iteration (bs, N) processing
+                # for _ in range(n_iters):
+                #     Mp = M_product(p)
+                #     # Compute alpha = (r^T * r) / (p^T * M * p)
+                #     r_dot_r = torch.sum(r * r, dim=1, keepdim=True)
+                #     p_dot_Mp = torch.sum(p * Mp, dim=1, keepdim=True)
+                #     alpha = r_dot_r / (p_dot_Mp + 1e-8)
+                #     v = v + alpha * p
+                #     r_new = r - alpha * Mp
+                #     # Compute beta = (r_new^T * r_new) / (r^T * r)
+                #     r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                #     beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+                #     p = r_new + beta * p
+                #     r = r_new
 
-                # CG iteration (bs, N) processing
-                for _ in range(n_iters):
-                    Mp = M_product(p)
-
-                    # Compute alpha = (r^T * r) / (p^T * M * p)
-                    r_dot_r = torch.sum(r * r, dim=1, keepdim=True)
-                    p_dot_Mp = torch.sum(p * Mp, dim=1, keepdim=True)
-                    alpha = r_dot_r / (p_dot_Mp + 1e-8)
-
-                    v = v + alpha * p
-                    r_new = r - alpha * Mp
-
-                    # Compute beta = (r_new^T * r_new) / (r^T * r)
-                    r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
-                    beta = r_new_dot_r_new / (r_dot_r + 1e-8)
-
-                    p = r_new + beta * p
-                    r = r_new
+                # ==========================================
+                # GMRES ( Batched )
+                # ==========================================
+                eps = 1e-8
+                vv = torch.zeros_like(b)  #
+                r0 = b  # 
+                beta = torch.norm(r0, dim=1, keepdim=True)  # (bs, 1)
+                # Store Arnoldi V Hessenberg H
+                V = [r0 / (beta + eps)]
+                H = torch.zeros(bs, n_iters + 1, n_iters, device=b.device, dtype=b.dtype)
+                # Batched Arnoldi (Modified Gram-Schmidt)
+                for k in range(n_iters):
+                    v_k = V[k]
+                    w = M_product(v_k)  # (bs, N)
+                    for i in range(k + 1):
+                        # h_{i,k} = v_i^T * w
+                        h_ik = torch.sum(V[i] * w, dim=1, keepdim=True)  # (bs, 1)
+                        H[:, i, k] = h_ik.squeeze(1)  # Hessenberg
+                        w = w - h_ik * V[i]  #
+                    # h_{k+1, k} = ||w||
+                    h_next = torch.norm(w, dim=1, keepdim=True)  # (bs, 1)
+                    H[:, k + 1, k] = h_next.squeeze(1)
+                    V.append(w / (h_next + eps))
+                # g = \beta * e_1
+                g = torch.zeros(bs, n_iters + 1, 1, device=b.device, dtype=b.dtype)
+                g[:, 0, :] = beta
+                # Batched Least Squares: min_y || H y - g ||_2
+                # H: (bs, n_iters+1, n_iters), g: (bs, n_iters+1, 1)
+                yy = torch.linalg.lstsq(H, g).solution  #: (bs, n_iters, 1)
+                # vv = V_k * y
+                # V_tensor: (bs, N, n_iters)
+                V_tensor = torch.stack(V[:-1], dim=2)
+                vv = torch.bmm(V_tensor, yy).squeeze(2)  # (bs, N)
+                v = vv
+                # ==========================================
 
                 final_vjp = H_funcs.Ht(v.view(1, -1))  # (1 -1)
                 final_vjp_input = final_vjp.view_as(img)
@@ -387,12 +415,17 @@ class GaussianDiffusion:
         s_temp = torch.zeros(H_funcs.block_num, H_funcs.N, device=device)
         y = measurement.view(H_funcs.block_num, H_funcs.N)
 
-        gamp = GAMP(
-            prior=lambda a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt: GAMP.sparse_prior3(a_t, b2_t, tau_r, x_t, x_0_hat,
-                                                                                        nabla_r_xt),
-            likelihood=lambda p, tau_p, y, noise_sigma: GAMP.awgn_likelihood_cs(p, tau_p, y, noise_sigma),
-            max_iter=22)   # 2 的时候出问题  1 3
+        # gamp = GAMP(
+        #     prior=lambda a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt: GAMP.sparse_prior3(a_t, b2_t, tau_r, x_t, x_0_hat,
+        #                                                                                 nabla_r_xt),
+        #     likelihood=lambda p, tau_p, y, noise_sigma: GAMP.awgn_likelihood_cs(p, tau_p, y, noise_sigma),
+        #     max_iter = 10)   # 10
 
+        noise_sigma = noise_std
+        delta0 = noise_sigma ** 2
+        bs = H_funcs.block_num
+        M = H_funcs.N
+        N = H_funcs.M
         for loop_idx, idx in enumerate(pbar):
             time = torch.tensor([idx] * img.shape[0], device=device)
             # print(time)
@@ -402,38 +435,41 @@ class GaussianDiffusion:
             x_t = img
             b2_t = (1 - self.alphas_cumprod[time])
             a_t = self.sqrt_alphas_cumprod[time]
-            noise_sigma = noise_std
             # sigma_t = b2_t / (a_t ** 2) # 
             sigma_t = b2_t / (a_t ** 2) # MMPS 1
-            delta0 = noise_sigma ** 2
-            bs = H_funcs.block_num
-            M = H_funcs.N
-            N = H_funcs.M
-
             x_hat = x_hat_temp
             tau_x = tau_x_temp
             s = s_temp
 
-            for iter in range(gamp.max_iter):
+            if idx < 21:
+                progress = 1 - (idx / 50) #
+                max_iter = int(3 + 12 * (progress ** 2)) #
+            elif idx < 30:
+                max_iter = 6
+            else:
+                max_iter = 6
+
+            for iter in range(max_iter):
                 with torch.no_grad():
-                    # --- 输出节点更新 ---
+                    # --- output Step ---
                     if iter == 0:
                         tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
 
                     p = H_funcs.H(x_hat.view(1, -1)).view(bs, M) - s * tau_p
+                    # z_hat, tau_z = gamp.likelihood(p, tau_p, y, delta0)
+                    tau_z = 1.0 / (1.0 / torch.clamp(tau_p, min=1e-15) + 1.0 / delta0)
+                    z_hat = (p / torch.clamp(tau_p, min=1e-15) + y / delta0) * tau_z
 
-                    z_hat, tau_z = gamp.likelihood(p, tau_p, y, delta0)
-                    tau_z = torch.real(tau_z)
-
-                    tau_p_clamped = torch.clamp(tau_p, min=1e-25)
+                    # tau_z = torch.real(tau_z)
+                    tau_p_clamped = torch.clamp(tau_p, min=1e-10)
                     s = (z_hat - p) / tau_p_clamped
                     tau_s = (1.0 - tau_z / tau_p_clamped) / tau_p_clamped
-                    tau_s = torch.real(tau_s)
-                    tau_s = torch.clamp(tau_s, min=1e-25)
+                    # tau_s = torch.real(tau_s)
+                    tau_s = torch.clamp(tau_s, min=1e-10)
 
-                    # --- 输入节点更新 ---
+                    # --- input Step ---
                     A2_tau_s = H_funcs.Ht_squared(tau_s.view(1, -1)).view(bs, N)
-                    tau_r = 1.0 / torch.clamp(A2_tau_s, min=1e-25)
+                    tau_r = 1.0 / torch.clamp(A2_tau_s, min=1e-10)
 
                     At_s = H_funcs.Ht(s.view(1, -1)).view(bs, N)
                     r = x_hat + tau_r * At_s
@@ -444,23 +480,19 @@ class GaussianDiffusion:
                         diff = r - x_t_flat / a_t
                         nabla_r_xt = diff / (1 * a_t * tau_r + b2_t / a_t)
 
-                    # elif alg_name == 'gamp-pgdm':
-                        # PGDM
-                        # with torch.enable_grad():
-                        #     x_0_hat_flat = x_0_hat.view(bs, N)
-                        #     diff = r.detach() - x_0_hat_flat
-                        #     norm = 0.5 * torch.sum(diff ** 2)
-                        #     norm_grad = torch.autograd.grad(outputs=norm, inputs=img, create_graph=False, retain_graph=False)[0]
-                        # nabla_r_xt = - norm_grad.view(bs, N) / (tau_r + b2_t / (a_t ** 2))
-                        # del norm_grad, norm, diff
+                    elif alg_name == 'gamp-pgdm':
+                        x_0_hat_flat = x_0_hat.view(bs, N)
+                        diff = r.detach() - x_0_hat_flat
+                        norm = 0.5 * torch.sum(diff ** 2)
+                        is_last_grad = (iter == max_iter - 1)
+                        norm_grad = torch.autograd.grad(outputs=norm, inputs=img, retain_graph=is_last_grad)[0]
+                        nabla_r_xt = - norm_grad.view(bs, N) / (tau_r + b2_t / (1))
+                        del norm_grad, norm, diff
                     else:
                         # MMPS
                         ## Compute b = r - E[x|x_t]
                         bb = r.detach() - x_0_hat.view(1, -1).view(bs, N)  # (bs, N)
-                        if alg_name == 'gamp_pgdm':
-                            n_iters = 1
-                        else:
-                            n_iters = 1
+                        n_iters = 1
 
                         def M_product(vv):
                             # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
@@ -481,29 +513,65 @@ class GaussianDiffusion:
                                 )[0]
                             # Obtain M*v = \Sigma_y * v + A * vjp
                             Avjp = vjp.view(1, -1).view(bs, N)
-                            return tau_r * vv + 1 * Avjp
+                            return tau_r * vv + Avjp
 
-                        vv = torch.zeros_like(bb)
-                        rr = bb - M_product(vv)
-                        pp = rr.clone()
-                        # CG iteration (bs, N) processing
-                        for _ in range(n_iters):
-                            Mp = M_product(pp)
-                            # Compute alpha = (r^T * r) / (p^T * M * p)
-                            r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
-                            p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
-                            alpha = r_dot_r / (p_dot_Mp + 1e-8)
-                            vv = vv + alpha * pp
-                            r_new = rr - alpha * Mp
-                            # Compute beta = (r_new^T * r_new) / (r^T * r)
-                            r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
-                            beta = r_new_dot_r_new / (r_dot_r + 1e-8)
-                            pp = r_new + beta * pp
-                            rr = r_new
+                        # vv = torch.zeros_like(bb)
+                        # rr = bb #  - M_product(vv) = 0
+                        # pp = rr.clone()
+                        # # CG iteration (bs, N) processing
+                        # for _ in range(n_iters):
+                        #     Mp = M_product(pp)
+                        #     # Compute alpha = (r^T * r) / (p^T * M * p)
+                        #     r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
+                        #     p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
+                        #     alpha = r_dot_r / (p_dot_Mp + 1e-8)
+                        #     vv = vv + alpha * pp
+                        #     r_new = rr - alpha * Mp
+                        #     # Compute beta = (r_new^T * r_new) / (r^T * r)
+                        #     r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                        #     beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+                        #     pp = r_new + beta * pp
+                        #     rr = r_new
+
+                        # ==========================================
+                        # GMRES ( Batched )
+                        # ==========================================
+                        eps = 1e-8
+                        vv = torch.zeros_like(bb)  #
+                        r0 = bb  # 
+                        beta = torch.norm(r0, dim=1, keepdim=True)  # (bs, 1)
+                        # Store Arnoldi V Hessenberg H
+                        V = [r0 / (beta + eps)]
+                        H = torch.zeros(bs, n_iters + 1, n_iters, device=bb.device, dtype=bb.dtype)
+                        # Batched Arnoldi (Modified Gram-Schmidt)
+                        for k in range(n_iters):
+                            v_k = V[k]
+                            w = M_product(v_k)  # (bs, N)
+                            for i in range(k + 1):
+                                # h_{i,k} = v_i^T * w
+                                h_ik = torch.sum(V[i] * w, dim=1, keepdim=True)  # (bs, 1)
+                                H[:, i, k] = h_ik.squeeze(1)  # Hessenberg
+                                w = w - h_ik * V[i]  #
+                            # h_{k+1, k} = ||w||
+                            h_next = torch.norm(w, dim=1, keepdim=True)  # (bs, 1)
+                            H[:, k + 1, k] = h_next.squeeze(1)
+                            V.append(w / (h_next + eps))
+
+                        # g = \beta * e_1
+                        g = torch.zeros(bs, n_iters + 1, 1, device=bb.device, dtype=bb.dtype)
+                        g[:, 0, :] = beta
+                        # Batched Least Squares: min_y || H y - g ||_2
+                        # H: (bs, n_iters+1, n_iters), g: (bs, n_iters+1, 1)
+                        yy = torch.linalg.lstsq(H, g).solution  #: (bs, n_iters, 1)
+                        # vv = V_k * y
+                        # V_tensor: (bs, N, n_iters)
+                        V_tensor = torch.stack(V[:-1], dim=2)
+                        vv = torch.bmm(V_tensor, yy).squeeze(2)  # (bs, N)
+                        # ==========================================
 
                         final_vjp_input = vv.view(1, -1).view_as(img)  # (1 -1)
 
-                        is_last_grad = (iter == gamp.max_iter - 1)
+                        is_last_grad = (iter == max_iter - 1)
                         score_y_given_x = torch.autograd.grad(
                             outputs=x_0_hat,
                             inputs=img,
@@ -511,11 +579,32 @@ class GaussianDiffusion:
                             retain_graph=not is_last_grad
                         )[0]  #
 
-                    nabla_r_xt = score_y_given_x
-                    del final_vjp_input
+                        nabla_r_xt = score_y_given_x
+                        del final_vjp_input
 
-                # 调用 prior
-                x_hat, tau_x, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
+                # prior
+                # x_hat, tau_x, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
+                nabla_xt_r = (a_t * x_0_hat - x_t) / (b2_t) + nabla_r_xt.view_as(img)
+                x_hat1 = (x_t + b2_t * nabla_xt_r) / (a_t)
+                x_hat = x_hat1.view(tau_r.shape)
+
+                if iter < max_iter - 1:   # < max_iter - 1:
+                    vx = torch.randn_like(x_t)
+                    hvp = torch.autograd.grad(
+                    outputs=nabla_xt_r, 
+                    inputs=x_t, 
+                    grad_outputs=vx, 
+                    retain_graph=True
+                    )[0]
+                    trace_H = vx * hvp
+                    # \tau_x = (b^2/a^2) + (b^4/a^2) * trace_H
+                    tau_x = (b2_t / a_t**2) + (b2_t**2 / a_t**2) * trace_H
+                else:
+                    tau_x = (b2_t / a_t ** 2) - (b2_t ** 2 / a_t ** 2) / ((a_t ** 2) * tau_r  + b2_t) #
+                # inflation_factor = 1.0 + 0.5 * b2_t.item()
+                # tau_x = tau_x * inflation_factor
+                tau_x = torch.clamp(tau_x, min=1e-15, max=1e8)
+
                 tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
 
                 del p, z_hat, tau_p_clamped, tau_s, A2_tau_s, At_s, r, nabla_r_xt
@@ -557,50 +646,52 @@ class GaussianDiffusion:
             # DPM-solver++
             # x_0_cur = x_hat1
 
-            # # 1. 准备当前步和下一步的系数 [cite: 58, 659]
+            # # 
             # lambda_cur = self.lambda_t[idx]
             # lambda_next = self.lambda_next[idx]
             # alpha_next = np.sqrt(self.alphas_cumprod_prev[idx])
             # sigma_cur = np.sqrt(1.0 - self.alphas_cumprod[idx])
             # sigma_next = np.sqrt(1.0 - self.alphas_cumprod_prev[idx])
-            # # 计算当前步长 h
+            # # h
             # h = lambda_next - lambda_cur
 
-            # # --- 严格按照 Algorithm 2 实现 ---
+            # # --- Algorithm 2 ---
             # if loop_idx == 0 or len(self.old_x_0_listhat) == 0:
-            #     # Step 4: 第一步执行一阶更新 (DPM-Solver++ 1) [cite: 215, 303]
+            #     # Step 4: 
             #     # x_next = (sigma_next / sigma_cur) * x - alpha_next * (exp(-h) - 1) * x_theta
             #     img = (sigma_next / sigma_cur) * img - alpha_next * torch.expm1(-torch.tensor(h, device=device)) * x_0_cur
 
-            #     # Step 5: 将当前输出存入缓存 [cite: 218]
+            #     # Step 5: 
             #     self.old_x_0_listhat.append((lambda_cur, x_0_cur))
 
             # else:
-            #     # Step 7: 计算步长比率 r = h_{i-1} / h_i [cite: 221]
+            #     # Step 7: r = h_{i-1} / h_i
             #     lambda_prev, x_0_prev = self.old_x_0_listhat[-1]
             #     h_prev = lambda_cur - lambda_prev
             #     r = h_prev / h
 
-            #     # Step 8: 计算二阶估计量 D_i [cite: 225]
+            #     # Step 8: D_i
             #     # D_i = (1 + 1/2r) * x_theta_cur - (1/2r) * x_theta_prev
             #     D_i = (1.0 + 1.0 / (2.0 * r)) * x_0_cur - (1.0 / (2.0 * r)) * x_0_prev
 
-            #     # Step 9: 执行二阶更新
+            #     # Step 9:
             #     # x_next = (sigma_next / sigma_cur) * x - alpha_next * (exp(-h) - 1) * D_i
             #     img = (sigma_next / sigma_cur) * img - alpha_next * torch.expm1(-torch.tensor(h, device=device)) * D_i
 
-            #     # Step 10: 更新缓存，仅保留最近一次信息以实现 2M [cite: 228]
+            #     # Step 10: 2M
             #     self.old_x_0_listhat.append((lambda_cur, x_0_cur))
             #     if len(self.old_x_0_listhat) > 1:
             #         self.old_x_0_listhat.pop(0)
 
             img = img.detach_()
-            # pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            pbar.set_postfix({'maxiter': max_iter}, refresh=False)
             if record:
                 if idx % 10 == 0:
                     file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
                     plt.imsave(file_path, clear_color(img))
             # img = img.clip_(-1,1)
+            ### 
+            torch.cuda.empty_cache()
 
         return img
 
@@ -650,6 +741,8 @@ class GaussianDiffusion:
             v_A_pri = v_A_pri_temp
             x_A_pri = x_A_pri_temp
             Turbo = 1
+            v_A_ext_old = 1*torch.ones(1, device=device)
+            x_A_ext_old = torch.zeros(H_funcs.block_num, H_funcs.M, device=device)
             with (torch.no_grad()):
                 for i in range(Turbo):
                     # ---------------------------------------------------------
@@ -666,7 +759,7 @@ class GaussianDiffusion:
 
                         # CG M * u = b
                     u = torch.zeros_like(b)
-                    r = b - M_product(u)
+                    r = b # - M_product(u) = 0
                     p = r.clone()
                     cg_iters = 3
                     for _ in range(cg_iters):
@@ -694,15 +787,16 @@ class GaussianDiffusion:
                     # v_A_ext = 1.0 / (1.0 / v_A_post - 1.0 / v_A_pri)
                     x_A_ext = v_A_ext * (x_A_post / v_A_post - x_A_pri / v_A_pri)
                     # Line 9
-                    x_B_pri, v_B_pri = x_A_ext, v_A_ext
-
+                    x_B_pri = x_A_ext * delta + x_A_ext_old * (1 - delta)
+                    v_B_pri = v_A_ext * delta + v_A_ext_old * (1 - delta)
+                    x_A_ext_old, v_A_ext_old = x_A_ext, v_A_ext
                     # MMPS
                     #   # Compute b = r - E[x|x_t]
                     bb = x_B_pri.detach() - x_0_hat.view(1, -1).view(bs, N)  # (bs, N)
                     n_iters = 1
                     def M_product2(vv):
                         # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
-                        vjp_input = (sigma_t + 0.1) * vv.view(1, -1)  # (1,-1)  # 0.1
+                        vjp_input = (sigma_t) * vv.view(1, -1)  # (1,-1)  # 0.1
                         # PGDM
                         # vjp = vjp_input
                         # MMPS  asymmetric
@@ -717,23 +811,59 @@ class GaussianDiffusion:
                         Avjp = vjp.view(1, -1).view(bs, N)
                         return v_B_pri * vv + 1 * Avjp
 
-                    vv = torch.zeros_like(bb)
-                    rr = bb - M_product2(vv)
-                    pp = rr.clone()
-                    # CG iteration (bs, N) processing
-                    for _ in range(n_iters):
-                        Mp = M_product2(pp)
-                        # Compute alpha = (r^T * r) / (p^T * M * p)
-                        r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
-                        p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
-                        alpha = r_dot_r / (p_dot_Mp + 1e-8)
-                        vv = vv + alpha * pp
-                        r_new = rr - alpha * Mp
-                        # Compute beta = (r_new^T * r_new) / (r^T * r)
-                        r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
-                        beta = r_new_dot_r_new / (r_dot_r + 1e-8)
-                        pp = r_new + beta * pp
-                        rr = r_new
+                    # vv = torch.zeros_like(bb)
+                    # rr = bb # - M_product2(vv) = 0
+                    # pp = rr.clone()
+                    # # CG iteration (bs, N) processing
+                    # for _ in range(n_iters):
+                    #     Mp = M_product2(pp)
+                    #     # Compute alpha = (r^T * r) / (p^T * M * p)
+                    #     r_dot_r = torch.sum(rr * rr, dim=1, keepdim=True)
+                    #     p_dot_Mp = torch.sum(pp * Mp, dim=1, keepdim=True)
+                    #     alpha = r_dot_r / (p_dot_Mp + 1e-8)
+                    #     vv = vv + alpha * pp
+                    #     r_new = rr - alpha * Mp
+                    #     # Compute beta = (r_new^T * r_new) / (r^T * r)
+                    #     r_new_dot_r_new = torch.sum(r_new * r_new, dim=1, keepdim=True)
+                    #     beta = r_new_dot_r_new / (r_dot_r + 1e-8)
+                    #     pp = r_new + beta * pp
+                    #     rr = r_new
+
+                    # ==========================================
+                    # GMRES ( Batched )
+                    # ==========================================
+                    eps = 1e-8
+                    vv = torch.zeros_like(bb)  #
+                    r0 = bb  # 
+                    beta = torch.norm(r0, dim=1, keepdim=True)  # (bs, 1)
+                    # Store Arnoldi V Hessenberg H
+                    V = [r0 / (beta + eps)]
+                    H = torch.zeros(bs, n_iters + 1, n_iters, device=bb.device, dtype=bb.dtype)
+                    # Batched Arnoldi (Modified Gram-Schmidt)
+                    for k in range(n_iters):
+                        v_k = V[k]
+                        w = M_product2(v_k)  # (bs, N)
+                        for i in range(k + 1):
+                            # h_{i,k} = v_i^T * w
+                            h_ik = torch.sum(V[i] * w, dim=1, keepdim=True)  # (bs, 1)
+                            H[:, i, k] = h_ik.squeeze(1)  # Hessenberg
+                            w = w - h_ik * V[i]  #
+                        # h_{k+1, k} = ||w||
+                        h_next = torch.norm(w, dim=1, keepdim=True)  # (bs, 1)
+                        H[:, k + 1, k] = h_next.squeeze(1)
+                        V.append(w / (h_next + eps))
+
+                    # g = \beta * e_1
+                    g = torch.zeros(bs, n_iters + 1, 1, device=bb.device, dtype=bb.dtype)
+                    g[:, 0, :] = beta
+                    # Batched Least Squares: min_y || H y - g ||_2
+                    # H: (bs, n_iters+1, n_iters), g: (bs, n_iters+1, 1)
+                    yy = torch.linalg.lstsq(H, g).solution  #: (bs, n_iters, 1)
+                    # vv = V_k * y
+                    # V_tensor: (bs, N, n_iters)
+                    V_tensor = torch.stack(V[:-1], dim=2)
+                    vv = torch.bmm(V_tensor, yy).squeeze(2)  # (bs, N)
+                    # ==========================================
 
                     final_vjp_input = vv.view(1, -1).view_as(img)  # (1 -1)
                     is_last_grad = (iter == gamp.max_iter - 1)
@@ -755,13 +885,13 @@ class GaussianDiffusion:
 
                 # Line 13-14
                 v_B_post = torch.mean(v_B_post_tensor)
-                v_B_post = torch.clamp(v_B_post, min=1e-25)
-                v_B_pri = torch.clamp(v_B_pri, min=1e-25)
+                v_B_post = torch.clamp(v_B_post, min=1e-15)
+                v_B_pri = torch.clamp(v_B_pri, min=1e-15)
                 v_B_ext = 1.0 / (1.0 / v_B_post - 1.0 / v_B_pri)
                 x_B_ext = v_B_ext * (x_B_post / v_B_post - x_B_pri / v_B_pri)
                 # Line 15
-                x_A_pri = x_B_ext * delta + x_A_pri * (1 - delta)
-                v_A_pri = v_B_ext * delta + v_A_pri * (1 - delta)
+                x_A_pri = x_B_ext
+                v_A_pri = v_B_ext
                 # x_A_pri, v_A_pri = x_B_ext, v_B_ext
 
             v_A_pri_temp = v_A_pri
