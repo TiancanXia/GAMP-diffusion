@@ -441,13 +441,13 @@ class GaussianDiffusion:
             tau_x = tau_x_temp
             s = s_temp
 
-            if idx < 21:
+            if idx < 50:
                 progress = 1 - (idx / 50) #
-                max_iter = int(3 + 12 * (progress ** 2)) #
+                max_iter = int(6 + 5 * (progress ** 2)) #
             elif idx < 30:
-                max_iter = 6
+                max_iter = 3
             else:
-                max_iter = 6
+                max_iter = 3
 
             for iter in range(max_iter):
                 with torch.no_grad():
@@ -515,6 +515,7 @@ class GaussianDiffusion:
                             Avjp = vjp.view(1, -1).view(bs, N)
                             return tau_r * vv + Avjp
 
+                        # CG
                         # vv = torch.zeros_like(bb)
                         # rr = bb #  - M_product(vv) = 0
                         # pp = rr.clone()
@@ -536,37 +537,54 @@ class GaussianDiffusion:
                         # ==========================================
                         # GMRES ( Batched )
                         # ==========================================
-                        eps = 1e-8
-                        vv = torch.zeros_like(bb)  #
-                        r0 = bb  # 
-                        beta = torch.norm(r0, dim=1, keepdim=True)  # (bs, 1)
-                        # Store Arnoldi V Hessenberg H
-                        V = [r0 / (beta + eps)]
-                        H = torch.zeros(bs, n_iters + 1, n_iters, device=bb.device, dtype=bb.dtype)
-                        # Batched Arnoldi (Modified Gram-Schmidt)
-                        for k in range(n_iters):
-                            v_k = V[k]
-                            w = M_product(v_k)  # (bs, N)
-                            for i in range(k + 1):
-                                # h_{i,k} = v_i^T * w
-                                h_ik = torch.sum(V[i] * w, dim=1, keepdim=True)  # (bs, 1)
-                                H[:, i, k] = h_ik.squeeze(1)  # Hessenberg
-                                w = w - h_ik * V[i]  #
-                            # h_{k+1, k} = ||w||
-                            h_next = torch.norm(w, dim=1, keepdim=True)  # (bs, 1)
-                            H[:, k + 1, k] = h_next.squeeze(1)
-                            V.append(w / (h_next + eps))
-
-                        # g = \beta * e_1
-                        g = torch.zeros(bs, n_iters + 1, 1, device=bb.device, dtype=bb.dtype)
-                        g[:, 0, :] = beta
-                        # Batched Least Squares: min_y || H y - g ||_2
-                        # H: (bs, n_iters+1, n_iters), g: (bs, n_iters+1, 1)
-                        yy = torch.linalg.lstsq(H, g).solution  #: (bs, n_iters, 1)
-                        # vv = V_k * y
-                        # V_tensor: (bs, N, n_iters)
-                        V_tensor = torch.stack(V[:-1], dim=2)
-                        vv = torch.bmm(V_tensor, yy).squeeze(2)  # (bs, N)
+                        # eps = 1e-8
+                        # vv = torch.zeros_like(bb)  #
+                        # r0 = bb  # 
+                        # beta = torch.norm(r0, dim=1, keepdim=True)  # (bs, 1)
+                        # # Store Arnoldi V Hessenberg H
+                        # V = [r0 / (beta + eps)]
+                        # H = torch.zeros(bs, n_iters + 1, n_iters, device=bb.device, dtype=bb.dtype)
+                        # # Batched Arnoldi (Modified Gram-Schmidt)
+                        # for k in range(n_iters):
+                        #     v_k = V[k]
+                        #     w = M_product(v_k)  # (bs, N)
+                        #     for i in range(k + 1):
+                        #         # h_{i,k} = v_i^T * w
+                        #         h_ik = torch.sum(V[i] * w, dim=1, keepdim=True)  # (bs, 1)
+                        #         H[:, i, k] = h_ik.squeeze(1)  # Hessenberg
+                        #         w = w - h_ik * V[i]  #
+                        #     # h_{k+1, k} = ||w||
+                        #     h_next = torch.norm(w, dim=1, keepdim=True)  # (bs, 1)
+                        #     H[:, k + 1, k] = h_next.squeeze(1)
+                        #     V.append(w / (h_next + eps))
+                        # # g = \beta * e_1
+                        # g = torch.zeros(bs, n_iters + 1, 1, device=bb.device, dtype=bb.dtype)
+                        # g[:, 0, :] = beta
+                        # # Batched Least Squares: min_y || H y - g ||_2
+                        # # H: (bs, n_iters+1, n_iters), g: (bs, n_iters+1, 1)
+                        # yy = torch.linalg.lstsq(H, g).solution  #: (bs, n_iters, 1)
+                        # # vv = V_k * y
+                        # # V_tensor: (bs, N, n_iters)
+                        # V_tensor = torch.stack(V[:-1], dim=2)
+                        # vv = torch.bmm(V_tensor, yy).squeeze(2)  # (bs, N)
+                        # # ==========================================
+                        # ==========================================
+                        # Optimization 2: GMRES (for n_iters = 1)
+                        # ==========================================
+                        eps_gmres = 1e-8
+                        r0 = bb
+                        beta = torch.norm(r0, dim=1, keepdim=True)         # (bs, 1)
+                        v_0 = r0 / (beta + eps_gmres)                      # (bs, N)
+                        w = M_product(v_0)                                 # (bs, N)
+                        # h_{0,0} = v_0^T * w
+                        h_00 = torch.sum(v_0 * w, dim=1, keepdim=True)     # (bs, 1)
+                        # w_perp = w - h_{0,0} * v_0
+                        w_perp = w - h_00 * v_0                            # (bs, N)
+                        # h_{1,0} = ||w_perp||
+                        h_10 = torch.norm(w_perp, dim=1, keepdim=True)     # (bs, 1)
+                        # y = (h_00 * beta) / (h_00^2 + h_10^2 + eps)
+                        y_opt = (h_00 * beta) / (h_00**2 + h_10**2 + eps_gmres) # (bs, 1)
+                        vv = v_0 * y_opt                                   # (bs, N)
                         # ==========================================
 
                         final_vjp_input = vv.view(1, -1).view_as(img)  # (1 -1)
@@ -588,15 +606,29 @@ class GaussianDiffusion:
                 x_hat1 = (x_t + b2_t * nabla_xt_r) / (a_t)
                 x_hat = x_hat1.view(tau_r.shape)
 
-                if iter < max_iter - 1:   # < max_iter - 1:
+                # if iter < max_iter - 1:   # < max_iter - 1:
+                #     vx = torch.randn_like(x_t)
+                #     hvp = torch.autograd.grad(
+                #     outputs=nabla_xt_r, 
+                #     inputs=x_t, 
+                #     grad_outputs=vx, 
+                #     retain_graph=True
+                #     )[0]
+                #     trace_H = vx * hvp
+                
+                # === Optimization 1: Only when iter == 0 ===
+                if iter <= 1 and max_iter > 1:
                     vx = torch.randn_like(x_t)
                     hvp = torch.autograd.grad(
-                    outputs=nabla_xt_r, 
-                    inputs=x_t, 
-                    grad_outputs=vx, 
-                    retain_graph=True
+                        outputs=nabla_xt_r, 
+                        inputs=x_t, 
+                        grad_outputs=vx, 
+                        retain_graph=True
                     )[0]
-                    trace_H = vx * hvp
+                    # Use detach()
+                    trace_H = (vx * hvp)
+
+                if iter < max_iter - 1:   # < max_iter - 1:
                     # \tau_x = (b^2/a^2) + (b^4/a^2) * trace_H
                     tau_x = (b2_t / a_t**2) + (b2_t**2 / a_t**2) * trace_H
                 else:

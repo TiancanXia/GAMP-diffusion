@@ -18,4 +18,4 @@ measurement:
 #    sparsity: 2304/16384
   noise: 
     name: gaussian
-    sigma: 0.1
+    sigma: 0.05

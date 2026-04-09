@@ -53,7 +53,7 @@ class LinearOperator(ABC):
 
 @register_operator(name='CS')
 class BlockCS_H(LinearOperator):
-    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 1323//1, device='cuda'):
+    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 3072//1, device='cuda'):
         # 12288 1200/3072/588/6075/1323
         """
         Args:
