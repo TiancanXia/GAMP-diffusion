@@ -36,18 +36,9 @@ mkdir models
 mv {DOWNLOAD_DIR}/ffhq_10m.pt ./models/
 ```
 
-**Note**: ImageNet checkpoint is also available in the same location.
-
 ### 3. Setup Environment
 
 #### Option 1: Local Environment Setup
-
-Clone external repositories for motion blurring and nonlinear deblurring:
-
-```bash
-git clone https://github.com/VinAIResearch/blur-kernel-space-exploring bkse
-git clone https://github.com/LeviBorodenko/motionblur motionblur
-```
 
 Create conda environment and install dependencies:
 
@@ -78,53 +69,6 @@ python3 sample_condition.py \
     --task_config=configs/CS_config.yaml
 ```
 
-**Note**: For ImageNet experiments, use `configs/imagenet_model_config.yaml`.
-
-## Supported Tasks
-
-### Linear Inverse Problems
-- **Compressed Sensing** (`configs/CS_config.yaml`)
-- **Super Resolution** (`configs/super_resolution_config.yaml`)
-- **Gaussian Deblurring** (`configs/gaussian_deblur_config.yaml`)
-- **Motion Deblurring** (`configs/motion_deblur_config.yaml`)
-- **Inpainting** (`configs/inpainting_config.yaml`)
-
-### Nonlinear Inverse Problems
-- **Nonlinear Deblurring** (`configs/nonlinear_deblur_config.yaml`)
-- **Phase Retrieval** (`configs/phase_retrieval_config.yaml`)
-
-## Configuration File Structure
-
-Task configurations are defined in YAML files. Here's an example structure:
-
-```yaml
-conditioning:
-  method: ps  # Options: ps, projection, mcg, vanilla (see guided_diffusion/condition_methods.py)
-  params:
-    scale: 2.0
-
-algorithm:
-  name: gamp_mmps  # Options: mmps, pgdm, dps, gamp_mmps, gamp_pgdm, vamp
-
-data:
-  name: ffhq  # Options: ffhq, bedroom, cat, celeba-hq
-  root: ./data/ffhq_samples/
-
-measurement:
-  operator:
-    name: CS  # Operator type
-  noise:
-    name: gaussian  # Options: gaussian, poisson
-    sigma: 0.05
-```
-
-### Key Parameters
-
-- **`conditioning.method`**: The conditioning method for posterior sampling
-- **`algorithm.name`**: The reconstruction algorithm (GAMP-based or baseline methods)
-- **`measurement.operator.name`**: The measurement operator type
-- **`noise.sigma`**: Noise level for Gaussian noise (adjust based on your scenario)
-
 ## Project Structure
 
 ```
@@ -133,7 +77,6 @@ GAMP-diffusion/
 ├── sample_condition.py     # Main inference script
 ├── compute_metric.py       # Metric computation utilities
 ├── guided_diffusion/       # Diffusion model components
-│   ├── condition_methods.py # Conditioning methods (PS, MCG, etc.)
 │   ├── measurements.py      # Measurement operators
 │   └── gaussian_diffusion.py # Diffusion sampler with GAMP integration
 ├── configs/                # Configuration files for different tasks
@@ -143,22 +86,6 @@ GAMP-diffusion/
 ```
 
 ## Algorithm Details
-
-The GAMP-Diffusion framework integrates GAMP iterations within the diffusion sampling process:
-
-1. **Output Node Update**: Computes estimates using the likelihood function
-2. **Input Node Update**: Incorporates prior information through the diffusion model
-3. **Gradient-based Refinement**: Uses diffusion model gradients for enhanced reconstruction
-
-Supported algorithms:
-- **MMPS**: Manifold-constrained Message Passing Sampling
-- **PGDM**: Projected Gradient Descent with Diffusion Models  
-- **DPS**: Diffusion Posterior Sampling
-- **GAMP-MMPS**: GAMP-enhanced MMPS
-- **GAMP-PGDM**: GAMP-enhanced PGDM
-- **VAMP**: Vector Approximate Message Passing
-
-## Results
 
 Example results will be saved in the `results/` directory with the following structure:
 - `input/`: Measurement inputs
