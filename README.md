@@ -1,12 +1,11 @@
 # GAMP-Diffusion: Generalized Approximate Message Passing-Based Diffusion Posterior Sampling
 
-This repository implements **GAMP-Diffusion**, a novel approach that combines Generalized Approximate Message Passing (GAMP) with diffusion models for solving linear and nonlinear inverse problems. The framework supports various tasks including compressed sensing (CS), image deblurring, inpainting, super-resolution, and phase retrieval.
+This repository implements **GAMP-Diffusion**, a novel approach that combines Generalized Approximate Message Passing (GAMP) with diffusion models for solving inverse problems.
 
 ## Key Features
 
 - **GAMP Integration**: Implements GAMP algorithm for efficient posterior sampling in diffusion models
-- **Multiple Algorithms**: Supports MMPS, PGDM, DPS, GAMP-MMPS, GAMP-PGDM, and VAMP algorithms
-- **Versatile Inverse Problems**: Handles both linear (CS, deblurring, inpainting) and nonlinear inverse problems
+- **Multiple Algorithms**: Supports MMPS, PGDM, DPS, GAMP-MMPS, and GAMP-PGDM algorithms
 - **Flexible Configuration**: Easy-to-use YAML configuration files for different tasks
 
 ## Prerequisites
