@@ -1,14 +1,4 @@
-# Diffusion Posterior Sampling for General Noisy Inverse Problems (ICLR 2023 spotlight)
-
-![result-gif1](./figures/motion_blur.gif)
-![result-git2](./figures/super_resolution.gif)
-<!-- See more results in the [project-page](https://jeongsol-kim.github.io/dps-project-page) -->
-
-## Abstract
-In this work, we extend diffusion solvers to efficiently handle general noisy (non)linear inverse problems via the approximation of the posterior sampling. Interestingly, the resulting posterior sampling scheme is a blended version of the diffusion sampling with the manifold constrained gradient without strict measurement consistency projection step, yielding more desirable generative path in noisy settings compared to the previous studies.
-
-![cover-img](./figures/cover.jpg)
-
+# Message Passing-Based Diffusion Posterior Sampling for Generalized Linear Inverse Problems
 
 ## Prerequisites
 - python 3.8
