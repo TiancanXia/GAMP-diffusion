@@ -28,23 +28,19 @@ class GAMP:
                 tau_x_init,
                 s_init):
 
-        # 获取输入所在的设备 (GPU/CPU)
         device = y.device
         dtype = y.dtype
 
-        # 形状解析
         bs = H_funcs.block_num
         M = H_funcs.N
         N = H_funcs.M
 
-        # 重用缓冲区 - 确保 device 一致
         if not self.buffer_initialized or self.x_hat_buf is None or self.x_hat_buf.shape != (bs, N):
             self.x_hat_buf = torch.zeros(bs, N, device=device, dtype=dtype)
             self.tau_x_buf = torch.ones(bs, N, device=device, dtype=dtype)
             self.s_buf = torch.zeros(bs, M, device=device, dtype=dtype)
             self.buffer_initialized = True
 
-        # 使用或初始化变量
         if x_init is None:
             x_hat = self.x_hat_buf.zero_()
         else:
@@ -60,7 +56,6 @@ class GAMP:
         else:
             s = self.s_buf.copy_(s_init.detach())
 
-        # 确保 noise_sigma 在正确设备上
         if not torch.is_tensor(noise_sigma):
             noise_sigma = torch.tensor(noise_sigma, dtype=dtype, device=device)
         else:
@@ -75,7 +70,6 @@ class GAMP:
 
         with torch.no_grad():
             for iter in range(self.max_iter):
-                # --- 输出节点更新 ---
                 if iter == 0:
                     tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
 
@@ -91,7 +85,6 @@ class GAMP:
                 tau_s = torch.real(tau_s)
                 tau_s = torch.clamp(tau_s, min=1e-25)
 
-                # --- 输入节点更新 ---
                 A2_tau_s = H_funcs.Ht_squared(tau_s.view(1, -1)).view(bs, N)
                 tau_r = 1.0 / torch.clamp(A2_tau_s, min=1e-25)
 
@@ -114,7 +107,7 @@ class GAMP:
                 nabla_r_xt = - norm_grad.view(bs, N) / (tau_r + b2_t / (a_t ** 2)) # tau_r + b2_t / (a_t ** 2) 
                 del norm_grad
 
-                # 调用 prior
+                # call prior
                 x_hat_new, tau_x_new, x_hat1 = self.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
 
                 x_hat = x_hat_new.detach() 
@@ -130,7 +123,6 @@ class GAMP:
     @staticmethod
     def awgn_likelihood_cs(p: Tensor, tau_p: Tensor,
                            y: Tensor, noise_power: float = 1.0) -> Tuple[Tensor, Tensor]:
-        # 确保常量也在 GPU 上（通过 p 的设备属性）
         sigma_w_sq = noise_power
         tau_z = 1.0 / (1.0 / torch.clamp(tau_p, min=1e-25) + 1.0 / sigma_w_sq)
         z_hat = (p / torch.clamp(tau_p, min=1e-25) + y / sigma_w_sq) * tau_z
