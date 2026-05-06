@@ -910,7 +910,7 @@ class GaussianDiffusion:
                 del final_vjp_input
 
                 tau_r = v_B_pri * torch.ones_like(x_B_pri)
-                # 调用 prior
+                # Call prior
                 x_B_post, v_B_post_tensor, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
 
                 del nabla_r_xt

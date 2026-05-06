@@ -105,7 +105,7 @@ print(f'DPS PSNR: {psnr_avg:.4f} | SSIM: {ssim_avg:.4f} | LPIPS: {lpips_avg:.4f}
 #
 # psnr_delta_avg = sum(psnr_delta_list) / len(psnr_delta_list)
 # lpips_delta_avg = sum(lpips_delta_list) / len(lpips_delta_list)
-# ssim_delta_avg = sum(ssim_delta_list) / len(ssim_delta_list)  # 新增
+# ssim_delta_avg = sum(ssim_delta_list) / len(ssim_delta_list)  # Added
 #
 # # psnr_normal_avg = sum(psnr_normal_list) / len(psnr_normal_list)
 # # lpips_normal_avg = sum(lpips_normal_list) / len(lpips_normal_list)
