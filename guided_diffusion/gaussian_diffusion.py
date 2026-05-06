@@ -243,12 +243,7 @@ class GaussianDiffusion:
             noise_sigma2 = noise_std ** 2
             b2_t = (1 - self.alphas_cumprod[time])
             a_t = self.sqrt_alphas_cumprod[time]
-            if alg_name == 'mmps':
-                sigma_t = b2_t / (a_t ** 1)  # MMPS
-                n_iters = 5  # 1 FOR MMPS 
-            else:
-                sigma_t = b2_t # PGDM
-                n_iters = 3  # 3 for GDPM
+            n_iters = 1
 
             pbar.set_postfix({'sigma_t': sigma_t.item()}, refresh=False)
 
@@ -910,7 +905,7 @@ class GaussianDiffusion:
                 del final_vjp_input
 
                 tau_r = v_B_pri * torch.ones_like(x_B_pri)
-                # 调用 prior
+                # call prior
                 x_B_post, v_B_post_tensor, x_hat1 = gamp.prior(a_t, b2_t, tau_r, x_t, x_0_hat, nabla_r_xt)
 
                 del nabla_r_xt
