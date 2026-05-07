@@ -5,7 +5,7 @@ This repository implements **GAMP-Diffusion**, a novel approach that combines Ge
 ## Key Features
 
 - **GAMP Integration**: Implements GAMP algorithm for efficient posterior sampling in diffusion models
-- **Multiple Algorithms**: Supports MMPS, PGDM, DPS, GAMP-MMPS, and GAMP-PGDM algorithms
+- **Multiple Algorithms**: Supports MMPS, PGDM, DPS, GAMP-MM, and GAMP-GA algorithms
 - **Flexible Configuration**: Easy-to-use YAML configuration files for different tasks
 
 ## Prerequisites

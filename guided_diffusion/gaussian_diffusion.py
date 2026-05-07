@@ -475,7 +475,7 @@ class GaussianDiffusion:
                         diff = r - x_t_flat / a_t
                         nabla_r_xt = diff / (1 * a_t * tau_r + b2_t / a_t)
 
-                    elif alg_name == 'gamp-pgdm':
+                    elif alg_name == 'gamp-ga':
                         x_0_hat_flat = x_0_hat.view(bs, N)
                         diff = r.detach() - x_0_hat_flat
                         norm = 0.5 * torch.sum(diff ** 2)
