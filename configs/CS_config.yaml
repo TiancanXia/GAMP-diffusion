@@ -4,11 +4,11 @@ conditioning:
     scale: 2 # default value 0.3  noise 0.05 best 2    noise 0.5 best 1
 
 algorithm:
-  name: gamp_mmps # mmps pgdm dps gamp_mmps gamp_pgdm vamp
+  name: gamp_mm # mmps pgdm dps gamp_mm gamp_ga vamp
 
 data:
   name: ffhq # choices: ffhq, bedroom, cat, celeba-hq
-  root: ./data/ffhq_samples/ # address to put the associated images  ffhq_samples
+  root: ./data/samples_denoise/ # address to put the associated images
 
 measurement:
   operator:
@@ -18,4 +18,4 @@ measurement:
 #    sparsity: 2304/16384
   noise: 
     name: gaussian
-    sigma: 0.05
+    sigma: 0.01

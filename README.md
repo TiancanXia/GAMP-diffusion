@@ -7,6 +7,26 @@ This repository implements **GAMP-Diffusion**, a novel approach that combines Ge
 - **GAMP Integration**: Implements GAMP algorithm for efficient posterior sampling in diffusion models
 - **Multiple Algorithms**: Supports MMPS, PGDM, DPS, GAMP-MM, and GAMP-GA algorithms
 - **Flexible Configuration**: Easy-to-use YAML configuration files for different tasks
+- **Non-Differentiable Observations**: Supports element-wise non-differentiable measurement functions $y = g(Ax + n)$ (e.g., quantization), solved via GAMP's decoupled output-step likelihood estimation
+
+## Non-Differentiable Observation Support
+
+GAMP-Diffusion extends the standard linear observation model to handle **non-differentiable element-wise measurement functions** $y = g(Ax + n)$, where $g$ can be any element-wise function (e.g., quantization, saturation). This is achieved by replacing only the output-step likelihood in GAMP, leaving the diffusion prior unchanged. Traditional gradient-based methods (DPS, MMPS, PGDM) are inapplicable here — GAMP-based algorithms are required.
+
+### Quantized Compressed Sensing
+
+Uniform quantization $y = Q_\Delta(Ax + n)$ with $Q_\Delta(\cdot) = \Delta \cdot \text{round}(\cdot / \Delta)$.
+
+```bash
+python3 sample_condition.py \
+    --model_config=configs/model_config.yaml \
+    --diffusion_config=configs/diffusion_config.yaml \
+    --task_config=configs/quantized_CS_config.yaml \
+    --gpu=0 \
+    --save_dir=./results
+```
+
+See `interface.md` for detailed mathematical derivation and implementation notes.
 
 ## Prerequisites
 

@@ -42,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_config', default='configs/model_config.yaml', type=str)
     parser.add_argument('--diffusion_config', default='configs/diffusion_config.yaml', type=str)
-    parser.add_argument('--task_config', default='configs/CS_config.yaml', type=str)
+    parser.add_argument('--task_config', default='configs/quantized_CS_config.yaml', type=str)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./results')
     parser.add_argument('--seed', type=int, default = 0)
@@ -132,22 +132,32 @@ def main():
 
         if measure_config['operator']['name'] == 'CS':
             from guided_diffusion.measurements import BlockCS_H
-            # batchsize = measure_config['operator']['batchsize']
             H_funcs = BlockCS_H(block_num=16, device=device)
             y_x = H_funcs.H(ref_img)
             noise = get_noise(**measure_config['noise'])
-            y_xn = y_x + noise.sigma * torch.randn_like(y_x)
+            y_noisy = y_x + noise.sigma * torch.randn_like(y_x)
+
+            # Non-differentiable element-wise observation (e.g., quantization)
+            obs_config = measure_config.get('observation', None)
+            if obs_config is not None and obs_config.get('type') == 'quantization':
+                from guided_diffusion.measurements import QuantizedObservation
+                obs_module = QuantizedObservation(step_size=obs_config['step_size'])
+                y_xn = obs_module.forward(y_noisy)
+            else:
+                obs_module = None
+                y_xn = y_noisy
             ratio = 1
         else:
             H_funcs = None
             y_xn = None
             noise = None
-        
+            obs_module = None
+
         # Sampling
         DPS_start_time = time.time()
         x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         if measure_config['operator']['name'] == 'CS':
-            sample = sample_fn(x_start=x_start, measurement=y_xn, H_funcs=H_funcs, noise_std = noise.sigma, config = task_config, record=True, save_root=out_path, diffusion_sampler = diffusion_config['sampler'])
+            sample = sample_fn(x_start=x_start, measurement=y_xn, H_funcs=H_funcs, noise_std=noise.sigma, config=task_config, record=True, save_root=out_path, diffusion_sampler=diffusion_config['sampler'], obs_module=obs_module)
         else:
             sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
 
@@ -166,7 +176,7 @@ def main():
         plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
         plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
 
-        # break
+        break
 
     end_time = time.time()
     running_time = end_time - start_time

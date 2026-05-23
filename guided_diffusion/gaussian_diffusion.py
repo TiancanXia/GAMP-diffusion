@@ -223,10 +223,17 @@ class GaussianDiffusion:
                       record,
                       save_root,
                       alg_name,
-                      diffusion_sampler):
+                      diffusion_sampler,
+                      obs_module=None):
         """
         The function used for sampling from noise.
-        """ 
+        """
+        if obs_module is not None:
+            raise ValueError(
+                "MMPS/PGDM/DPS require a differentiable measurement model, "
+                "but a non-differentiable observation (obs_module) was provided. "
+                "Use a GAMP-based algorithm instead (e.g., gamp_mm, gamp_ga, gamp-ga)."
+            )
         img = x_start
         device = x_start.device
 
@@ -400,7 +407,8 @@ class GaussianDiffusion:
                            record,
                            save_root,
                            alg_name,
-                           diffusion_sampler):
+                           diffusion_sampler,
+                           obs_module=None):
         """
         The function used for sampling from noise.
         """
@@ -456,9 +464,12 @@ class GaussianDiffusion:
                         tau_p = (H_funcs.H_squared(tau_x.view(1, -1))).view(bs, M)
 
                     p = H_funcs.H(x_hat.view(1, -1)).view(bs, M) - s * tau_p
-                    # z_hat, tau_z = gamp.likelihood(p, tau_p, y, delta0)
-                    tau_z = 1.0 / (1.0 / torch.clamp(tau_p, min=1e-15) + 1.0 / delta0)
-                    z_hat = (p / torch.clamp(tau_p, min=1e-15) + y / delta0) * tau_z
+
+                    if obs_module is not None:
+                        z_hat, tau_z = obs_module.gamp_likelihood(p, tau_p, y, noise_sigma)
+                    else:
+                        tau_z = 1.0 / (1.0 / torch.clamp(tau_p, min=1e-15) + 1.0 / delta0)
+                        z_hat = (p / torch.clamp(tau_p, min=1e-15) + y / delta0) * tau_z
 
                     # tau_z = torch.real(tau_z)
                     tau_p_clamped = torch.clamp(tau_p, min=1e-10)
@@ -498,11 +509,11 @@ class GaussianDiffusion:
                             # Compute VJP: (grad_outputs^T * J)^T -> J^T * grad_outputs
                             vjp_input = (sigma_t) * vv.view(1, -1)  # (1,-1)  # 0.1
 
-                            if alg_name == 'gamp_pgdm':
+                            if alg_name == 'gamp_ga':
                                 # PGDM
                                 vjp = vjp_input
 
-                            elif alg_name == 'gamp_mmps':
+                            elif alg_name == 'gamp_mm':
                                 # MMPS  asymmetric
                                 vjp_input_for_grad = vjp_input.view_as(img)
                                 vjp = torch.autograd.grad(
@@ -736,10 +747,16 @@ class GaussianDiffusion:
                            record,
                            save_root,
                            alg_name,
-                           diffusion_sampler):
+                           diffusion_sampler,
+                           obs_module=None):
         """
         The function used for sampling from noise.
         """
+        if obs_module is not None:
+            raise NotImplementedError(
+                "VAMP with non-differentiable observation is not yet implemented. "
+                "Use a GAMP-based algorithm instead (e.g., gamp_mm, gamp_ga, gamp-ga)."
+            )
         img = x_start
         device = x_start.device
 
@@ -979,17 +996,18 @@ class GaussianDiffusion:
                       config=None,
                       record=False,
                       save_root=None,
-                      diffusion_sampler = 'mmps'):
+                      diffusion_sampler = 'mmps',
+                      obs_module=None):
 
         # alg_name
         alg_name = config.get('algorithm', {}).get('name', 'mmps')
         # (Algorithm Dispatcher)
         if 'gamp' in alg_name:
-            img = self._step_gamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+            img = self._step_gamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler, obs_module=obs_module)
         elif 'vamp' in alg_name:
-            img = self._step_vamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+            img = self._step_vamp(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler, obs_module=obs_module)
         else:
-            img = self._step_mmps(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler)
+            img = self._step_mmps(model, x_start, measurement, H_funcs, noise_std, record, save_root, alg_name, diffusion_sampler, obs_module=obs_module)
 
         return img
 

@@ -1,5 +1,6 @@
 '''This module handles task-dependent operations (A) and noises (n) to simulate a measurement y=Ax+n.'''
 
+import math
 from abc import ABC, abstractmethod
 from functools import partial
 import yaml
@@ -53,7 +54,7 @@ class LinearOperator(ABC):
 
 @register_operator(name='CS')
 class BlockCS_H(LinearOperator):
-    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 3072//1, device='cuda'):
+    def __init__(self, img_dim=196608, block_num=16, block_dim=12288//1, compressed_dim = 588//1, device='cuda'):
         # 12288 1200/3072/588/6075/1323
         """
         Args:
@@ -453,3 +454,118 @@ class PoissonNoise(Noise):
         #     data = data * (old_max + 1.0) - 1.0
        
         # return data.clamp(low_clip, 1.0)
+
+
+# ==========================================
+# Non-differentiable element-wise observation
+# ==========================================
+
+class NonDiffObservation(ABC):
+    """Base class for non-differentiable element-wise observation y = g(Ax + n).
+
+    GAMP decouples the output step from the input step: the likelihood
+    (output step) handles g while the prior (input step) only sees the
+    diffusion model. This class encapsulates the output-step logic so
+    that _step_gamp can call likelihood() instead of the hardcoded AWGN
+    formula.
+    """
+
+    @abstractmethod
+    def forward(self, z):
+        """Apply g(z) element-wise.
+
+        Args:
+            z: (bs, M) tensor of noisy linear measurements.
+
+        Returns:
+            y: (bs, M) tensor after element-wise non-differentiable g.
+        """
+        pass
+
+    @abstractmethod
+    def gamp_likelihood(self, p, tau_p, y, noise_sigma):
+        """GAMP output-step posterior for y = g(z + n), n ~ N(0, sigma^2).
+
+        Given prior  z_i ~ N(p_i, tau_p_i)  and observation y_i = g(z_i + n_i),
+        compute the scalar posterior mean and variance element-wise.
+
+        Args:
+            p:          (bs, M) prior mean.
+            tau_p:      (bs, M) prior variance.
+            y:          (bs, M) observed (quantized) values.
+            noise_sigma: scalar, std of pre-g noise n.
+
+        Returns:
+            z_hat: (bs, M) posterior mean  E[z | y].
+            tau_z: (bs, M) posterior variance Var[z | y].
+        """
+        pass
+
+
+class QuantizedObservation(NonDiffObservation):
+    """Uniform quantizer:  y = delta * round((z + n) / delta).
+
+    The posterior mean / variance are computed by numerical integration
+    on a fixed grid in the standard-normal (u) space.
+    """
+
+    def __init__(self, step_size, n_integration=51):
+        self.delta = step_size
+        self.n_grid = n_integration
+
+    def forward(self, z):
+        return self.delta * torch.round(z / self.delta)
+
+    def gamp_likelihood(self, p, tau_p, y, noise_sigma):
+        """
+        Numerical integration via grid in u-space (u ~ N(0,1)):
+            z_j = p + sqrt(tau_p) * u_j
+        prior     ∝ exp(-u_j^2 / 2)
+        likelihood = Phi((y + 0.5*delta - z_j) / sigma)
+                   - Phi((y - 0.5*delta - z_j) / sigma)
+        """
+        bs, M = p.shape
+        device = p.device
+        delta = self.delta
+        sigma_n = noise_sigma
+
+        # -- integration grid in u-space --
+        u_max = 5.0
+        u = torch.linspace(-u_max, u_max, self.n_grid, device=device, dtype=p.dtype)
+
+        sqrt_tau_p = torch.sqrt(torch.clamp(tau_p, min=1e-15))
+        z_grid = p.unsqueeze(-1) + sqrt_tau_p.unsqueeze(-1) * u  # (bs, M, n_grid)
+
+        # -- prior (Gaussian in u-space) --
+        log_prior = -0.5 * u.pow(2)  # (n_grid,)
+
+        # -- likelihood: difference of two normal CDFs --
+        y_exp = y.unsqueeze(-1)
+        upper = (y_exp + 0.5 * delta - z_grid) / sigma_n
+        lower = (y_exp - 0.5 * delta - z_grid) / sigma_n
+
+        cdf_upper = 0.5 * (1.0 + torch.erf(upper / math.sqrt(2.0)))
+        cdf_lower = 0.5 * (1.0 + torch.erf(lower / math.sqrt(2.0)))
+
+        likelihood = cdf_upper - cdf_lower
+        likelihood = torch.clamp(likelihood, min=1e-15)
+
+        # -- unnormalized log-posterior --
+        log_likelihood = torch.log(likelihood)
+        log_post = log_prior + log_likelihood  # broadcasts: (n_grid,) + (bs, M, n_grid)
+
+        # -- normalize (log-sum-exp trick) --
+        log_post_max = torch.max(log_post, dim=-1, keepdim=True)[0]
+        post = torch.exp(log_post - log_post_max)
+        post_sum = torch.sum(post, dim=-1, keepdim=True)
+        post = post / post_sum
+
+        # -- posterior mean --
+        z_hat = torch.sum(z_grid * post, dim=-1)
+
+        # -- posterior variance --
+        z_diff = z_grid - z_hat.unsqueeze(-1)
+        tau_z = torch.sum(z_diff.pow(2) * post, dim=-1)
+        tau_z = torch.clamp(tau_z, min=1e-15, max=1e8)
+
+        return z_hat, tau_z
