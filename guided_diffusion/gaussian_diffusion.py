@@ -243,7 +243,12 @@ class GaussianDiffusion:
             noise_sigma2 = noise_std ** 2
             b2_t = (1 - self.alphas_cumprod[time])
             a_t = self.sqrt_alphas_cumprod[time]
-            n_iters = 1
+            if alg_name == 'mmps':
+                sigma_t = b2_t / (a_t ** 1)  # MMPS
+
+            else:
+                sigma_t = b2_t # PGDM
+            n_iters = 1  # GDPM
 
             pbar.set_postfix({'sigma_t': sigma_t.item()}, refresh=False)
 
