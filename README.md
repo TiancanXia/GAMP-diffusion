@@ -1,6 +1,6 @@
-# GAMP-Diffusion: Generalized Approximate Message Passing-Based Diffusion Posterior Sampling
+# MP-Diffusion
 
-This repository implements **GAMP-Diffusion**, a novel approach that combines Generalized Approximate Message Passing (GAMP) with diffusion models for solving inverse problems.
+This repository implements **MP-Diffusion**, a novel approach that combines Message Passing (GAMP) with diffusion models for solving inverse problems.
 
 ## Key Features
 
