@@ -1,6 +1,6 @@
-# MP-Diffusion
+# GAMP-Diffusion
 
-This repository implements **MP-Diffusion**, a novel approach that combines Message Passing (GAMP) with diffusion models for solving inverse problems.
+This repository implements **MP-Diffusion**, a novel approach that combines Message Passing (MP) with diffusion models for solving inverse problems.
 
 ## Key Features
 
