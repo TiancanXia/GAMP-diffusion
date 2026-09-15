@@ -114,16 +114,16 @@ Example results will be saved in the `results/` directory with the following str
 
 ## Citation
 
-If you find this work useful in your research, please cite the original DPS paper:
+If you find this work useful in your research, please cite:
 
 ```bibtex
-@inproceedings{
-chung2023diffusion,
-title={Diffusion Posterior Sampling for General Noisy Inverse Problems},
-author={Hyungjin Chung and Jeongsol Kim and Michael Thompson Mccann and Marc Louis Klasky and Jong Chul Ye},
-booktitle={The Eleventh International Conference on Learning Representations},
-year={2023},
-url={https://openreview.net/forum?id=OnD9zGAGT0k}
+@software{xia_gamp_diffusion,
+  author    = {Xia, Tiancan},
+  title     = {{GAMP-diffusion}},
+  year      = {2026},
+  publisher = {GitHub},
+  url       = {https://github.com/TiancanXia/GAMP-diffusion},
+  note      = {GitHub repository}
 }
 ```
 
