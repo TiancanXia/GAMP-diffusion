@@ -117,13 +117,12 @@ Example results will be saved in the `results/` directory with the following str
 If you find this work useful in your research, please cite:
 
 ```bibtex
-@software{xia_gamp_diffusion,
-  author    = {Xia, Tiancan},
-  title     = {{GAMP-diffusion}},
-  year      = {2026},
-  publisher = {GitHub},
-  url       = {https://github.com/TiancanXia/GAMP-diffusion},
-  note      = {GitHub repository}
+@misc{xia_gamp_diffusion,
+  author       = {Xia, Tiancan},
+  title        = {{GAMP-diffusion}},
+  howpublished = {\url{https://github.com/TiancanXia/GAMP-diffusion}},
+  year         = {2026},
+  note         = {GitHub repository}
 }
 ```
 
